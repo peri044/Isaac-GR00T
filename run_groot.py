@@ -37,6 +37,7 @@ def get_groot_policy(args: argparse.Namespace):
             modality_config=modality_config,
             modality_transform=modality_transform,
             device=args.device,
+            denoising_steps=args.denoising_steps,
             compute_dtype=get_torch_dtype(args.precision),
         )
         # Cast all the model components of the policy to the precision specified in the args.
@@ -89,12 +90,12 @@ def eval_outputs(pyt_model, trt_model, inputs, args: argparse.Namespace):
         else:
             pyt_output = pyt_model(inputs)
             trt_output = trt_model(inputs)
-        breakpoint()
+
         if isinstance(pyt_output, torch.Tensor) and isinstance(trt_output, torch.Tensor):
             print("Diff: ", torch.mean(torch.abs(pyt_output - trt_output)))
         elif isinstance(pyt_output, BaseModelOutputWithPooling) and isinstance(trt_output, BaseModelOutputWithPooling):
-            print("Diff: ", torch.mean(torch.abs(pyt_output.last_hidden_state - trt_output.last_hidden_state)))
-            print("Diff: ", torch.mean(torch.abs(pyt_output.pooler_output - trt_output.pooler_output)))
+            print("Diff: ", torch.mean(torch.abs(pyt_output[1][-1] - trt_output[1][-1])))
+            print("Diff: ", torch.mean(torch.abs(pyt_output[0] - trt_output[0])))
 
 def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace):
     """
@@ -154,8 +155,7 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     }
 
     settings = get_compilation_args(args)
-    settings.update({"allow_complex_guards_as_runtime_asserts": True})
-    settings.update({"strict": False})
+    
     trt_language_model = torch_tensorrt.MutableTorchTensorRTModule(language_model, **settings)
     trt_language_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
@@ -213,35 +213,20 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace):
     dynamic_shapes = ({0: BATCH_DIM, 1: SEQ_LEN_DIM},)
 
     # Compile the vlln
-    vlln_ep = torch.export._trace._export(
-                model.vlln,
-                args=(inputs,),
-                kwargs={},
-                dynamic_shapes=dynamic_shapes,
-                strict=False,
-                allow_complex_guards_as_runtime_asserts=True,
-            )
+    trt_vlln = torch_tensorrt.MutableTorchTensorRTModule(model.vlln, **get_compilation_args(args))
+
+    trt_vlln.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_vlln = torch_tensorrt.dynamo.compile(vlln_ep, 
-                                                [inputs], 
-                                                **get_compilation_args(args))
+        trt_vlln(inputs)
+
     eval_outputs(model.vlln, trt_vlln, inputs, args)
 
     model.vlln = trt_vlln
 
-    # Compile the vl_self_attention
-    vl_self_attention_ep = torch.export._trace._export(
-                model.vl_self_attention,
-                args=(inputs,),
-                kwargs={},
-                dynamic_shapes=dynamic_shapes,
-                strict=False,
-                allow_complex_guards_as_runtime_asserts=True,
-            )
+    trt_vl_self_attention = torch_tensorrt.MutableTorchTensorRTModule(model.vl_self_attention, **get_compilation_args(args))
+    trt_vl_self_attention.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_vl_self_attention = torch_tensorrt.dynamo.compile(vl_self_attention_ep,
-                                                              [inputs], 
-                                                              **get_compilation_args(args))
+        trt_vl_self_attention(inputs)
 
     eval_outputs(model.vl_self_attention, trt_vl_self_attention, inputs, args)
     
@@ -257,30 +242,21 @@ def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace):
         model: The action head of the GR00T model
         device: Device to run compilation on (default: "cuda")
     """
-    # BATCH_SIZE = 2
+    BATCH_SIZE = 2
     HIDDEN_SIZE = 64
     action_input_state = torch.randn(
-        (1, 1, HIDDEN_SIZE),
+        (BATCH_SIZE, 1, HIDDEN_SIZE),
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
 
-    embodiment_id = torch.tensor([24], dtype=torch.int64, device=args.device)
-    # BATCH_DIM = torch.export.Dim("batch", min=2, max=8)
-    # dynamic_shapes = ({0: BATCH_DIM}, None)
-    ep = torch.export._trace._export(
-                model,
-                args=(action_input_state, embodiment_id),
-                kwargs={},
-                # dynamic_shapes=dynamic_shapes,
-                strict=False,
-                allow_complex_guards_as_runtime_asserts=True,
-            )
-    
+    embodiment_id = torch.tensor([24, 24], dtype=torch.int64, device=args.device)
+    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
+    dynamic_shapes = ({0: BATCH_DIM}, {0: BATCH_DIM})
+    trt_state_encoder = torch_tensorrt.MutableTorchTensorRTModule(model, **get_compilation_args(args))
+    trt_state_encoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_state_encoder = torch_tensorrt.dynamo.compile(ep, 
-                                                          [action_input_state], 
-                                                          **get_compilation_args(args))
+        trt_state_encoder(action_input_state, embodiment_id)
 
     eval_outputs(model, trt_state_encoder, (action_input_state, embodiment_id), args)
     return trt_state_encoder
@@ -293,23 +269,20 @@ def compile_action_encoder(action_encoder: torch.nn.Module, args: argparse.Names
         model: The action head of the GR00T model
         device: Device to run compilation on (default: "cuda")
     """
+    BATCH_SIZE = 2
     action_inputs = torch.randn(
-        (1, 16, 32),
+        (BATCH_SIZE, 16, 32),
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
-    timesteps = torch.tensor([0], dtype=torch.int64, device=args.device)
-    embodiment_id = torch.tensor([24], dtype=torch.int64, device=args.device)
-
-    ep = torch.export._trace._export(
-                action_encoder,
-                args=(action_inputs, timesteps, embodiment_id),
-                kwargs={},
-                strict=False,
-                allow_complex_guards_as_runtime_asserts=True,
-            )
+    timesteps = torch.tensor([0, 0], dtype=torch.int64, device=args.device)
+    embodiment_id = torch.tensor([24, 24], dtype=torch.int64, device=args.device)
+    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
+    dynamic_shapes = ({0: BATCH_DIM}, {0: BATCH_DIM}, {0: BATCH_DIM})
+    trt_action_encoder = torch_tensorrt.MutableTorchTensorRTModule(action_encoder, **get_compilation_args(args))
+    trt_action_encoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_action_encoder = torch_tensorrt.dynamo.compile(ep, [action_inputs, timesteps, embodiment_id], **get_compilation_args(args))
+        trt_action_encoder(action_inputs, timesteps, embodiment_id)
     eval_outputs(action_encoder, trt_action_encoder, (action_inputs, timesteps, embodiment_id), args)
     
     return trt_action_encoder
@@ -322,30 +295,25 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace):
         model: The DIT model to compile
         device: Device to run compilation on (default: "cuda")
     """
+    BATCH_SIZE = 2
     hidden_states = torch.randn(
-        (2, 17, 1536),
+        (BATCH_SIZE, 49, 1536), # TODO: Change this to 17
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
     seq_len = torch.export.Dim("seq_len", min=1, max=1024)
     batch_dim = torch.export.Dim("batch", min=1, max=8)
     encoder_hidden_states = torch.randn(
-        (2, 294, 2048),
+        (BATCH_SIZE, 294, 2048),
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
-    timesteps = torch.tensor([1], dtype=torch.int64, device=args.device)
-    dynamic_shapes = ({0: batch_dim, 1: seq_len}, {0: batch_dim}, None)
-    ep = torch.export._trace._export(
-                model,
-                args=(hidden_states, encoder_hidden_states, timesteps),
-                kwargs={},
-                dynamic_shapes=dynamic_shapes,
-                strict=False,
-                allow_complex_guards_as_runtime_asserts=True,
-            )
+    timesteps = torch.tensor([1, 1], dtype=torch.int64, device=args.device)
+    dynamic_shapes = ({0: batch_dim}, {0: batch_dim, 1: seq_len}, {0: batch_dim})
+    trt_dit_model = torch_tensorrt.MutableTorchTensorRTModule(model, **get_compilation_args(args))
+    trt_dit_model.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_dit_model = torch_tensorrt.dynamo.compile(ep, [hidden_states, encoder_hidden_states, timesteps], **get_compilation_args(args))
+        trt_dit_model(hidden_states, encoder_hidden_states, timesteps)
 
     eval_outputs(model, trt_dit_model, (hidden_states, encoder_hidden_states, timesteps), args)
     return trt_dit_model
@@ -354,8 +322,9 @@ def compile_action_decoder(model: torch.nn.Module, args: argparse.Namespace):
     """
     Compile the action decoder of the GrootN1.5 model using Torch-TensorRT.
     """
+    BATCH_SIZE = 2
     hidden_states = torch.randn(
-        (2, 17, 1024),
+        (BATCH_SIZE, 17, 1024),
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
@@ -364,17 +333,10 @@ def compile_action_decoder(model: torch.nn.Module, args: argparse.Namespace):
     embodiment_id = torch.tensor([24, 24], dtype=torch.int64, device=args.device)
     dynamic_shapes = ({0: batch_dim},{0: batch_dim})
 
-    ep = torch.export._trace._export(   
-                model,
-                args=(hidden_states, embodiment_id),
-                kwargs={},
-                dynamic_shapes=dynamic_shapes,
-                strict=False,
-                allow_complex_guards_as_runtime_asserts=True,
-            )
-    
+    trt_action_decoder = torch_tensorrt.MutableTorchTensorRTModule(model, **get_compilation_args(args))
+    trt_action_decoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_action_decoder = torch_tensorrt.dynamo.compile(ep, [hidden_states], **get_compilation_args(args))
+        trt_action_decoder(hidden_states, embodiment_id)
     
     eval_outputs(model, trt_action_decoder, (hidden_states, embodiment_id), args)
 
@@ -430,6 +392,7 @@ def get_compilation_args(args: argparse.Namespace):
     full_compilation_args = {}
     full_compilation_args.update(COMMON_COMPILATION_ARGS)
     full_compilation_args.update({"enabled_precisions": enabled_precisions})
+    full_compilation_args.update({"min_block_size": 1})
     if args.use_explicit_typing:
         full_compilation_args.update({"use_explicit_typing": args.use_explicit_typing})
     if args.use_fp32_acc:
@@ -438,6 +401,9 @@ def get_compilation_args(args: argparse.Namespace):
         full_compilation_args.update({"debug": args.debug})
     if args.cpu_offload:
         full_compilation_args.update({"offload_module_to_cpu": args.cpu_offload})
+    
+    full_compilation_args.update({"allow_complex_guards_as_runtime_asserts": True})
+    full_compilation_args.update({"strict": False})
     return full_compilation_args
 
 def compare_outputs(pyt_outputs, trt_outputs):
@@ -568,10 +534,15 @@ def run_groot_inference(
     with torch.inference_mode(), torch.no_grad():
         policy = get_groot_policy(args)
 
-        step_data = get_dataset(args)
+        # step_data = get_dataset(args)
+        step_data = torch.load("/work/TensorRT/tools/groot_main/Isaac-GR00T/step_data.pt", weights_only=False)
 
         # Run pytorch inference and get the predicted action
-        pyt_predicted_action = policy.get_action(step_data, use_position_ids=True)
+        pyt_predicted_action = policy.get_action(step_data) # use_position_ids=True
+        pyt_predicted_action2 = policy.get_action(step_data) 
+        # pyt_loaded_prediction = torch.load("/work/TensorRT/tools/groot_main/Isaac-GR00T/predicted_action_torch.pt", weights_only=False)
+        compare_predictions(pyt_predicted_action, pyt_predicted_action2)
+        breakpoint()
         # trt_predicted_action = policy.get_action(step_data, use_position_ids=True)
         # compare_outputs(pyt_predicted_action, trt_predicted_action)
         # breakpoint()
@@ -610,7 +581,6 @@ def run_groot_inference(
 
         # Replace the model in the policy with the Torch-TensorRT compiled model
         policy.model = model
-   
         # Run the Torch-TensorRT compiled model and get the predicted action
         trt_predicted_action = policy.get_action(step_data, use_position_ids=True)
 
@@ -648,6 +618,12 @@ if __name__ == "__main__":
         type=str,
         help="FP16 or FP32",
         default="FP16",
+    )
+    parser.add_argument(
+        "--denoising_steps",
+        type=int,
+        help="Number of denoising steps",
+        default=1,
     )
     parser.add_argument(
         "--fn_name",
