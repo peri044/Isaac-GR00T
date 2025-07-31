@@ -48,8 +48,9 @@ class EagleBackbone(nn.Module):
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
+        config._attn_implementation = "sdpa"
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
-
+        self.use_position_ids = False
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
         else:
@@ -105,12 +106,19 @@ class EagleBackbone(nn.Module):
             if k.startswith(eagle_prefix)
         }
         del eagle_input["image_sizes"]
+        attention_mask_input = eagle_input["attention_mask"]
+        if self.use_position_ids:
+            eagle_input.pop("attention_mask")
+            eagle_position_ids = torch.arange(eagle_input["input_ids"].shape[1], dtype=torch.int64).unsqueeze(0).to(
+                eagle_input["input_ids"].device
+            ).repeat(eagle_input["input_ids"].shape[0], 1)
+            eagle_input["position_ids"] = eagle_position_ids
 
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
-        return eagle_features, eagle_input["attention_mask"]
+        return eagle_features, attention_mask_input
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
