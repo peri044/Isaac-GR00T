@@ -11,12 +11,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from functools import partial
 from typing import Any, Optional
-
-COMMON_COMPILATION_ARGS = {
-    "min_block_size": 1,
-    "disable_tf32": True,
-    "use_python_runtime": True,
-}
+from utils import benchmark_policy, compare_benchmark_outputs
 
 def get_groot_policy(args: argparse.Namespace):
     """
@@ -133,6 +128,12 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
         trt_vision_model(**kwarg_inputs)
     
     eval_outputs(vision_model, trt_vision_model, kwarg_inputs, args)
+
+    if args.benchmark and args.fn_name == "vision_model":
+        pyt_timings = benchmark_policy(vision_model, (), kwarg_inputs, args=args)
+        trt_timings = benchmark_policy(trt_vision_model, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
     return trt_vision_model
 
 def compile_language_model(language_model: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
@@ -166,6 +167,12 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
         trt_language_model(**kwarg_inputs)
     
     eval_outputs(language_model, trt_language_model, kwarg_inputs, args)
+
+    if args.benchmark and args.fn_name == "language_model":
+        pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
+        trt_timings = benchmark_policy(trt_language_model, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
     return trt_language_model
 
 def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
@@ -258,6 +265,11 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
             optimized_process_backbone_output, model
         )
 
+    if args.benchmark and args.fn_name == "vl_components":
+        pyt_timings = benchmark_policy(vl_components_module, (inputs,), {}, args=args)
+        trt_timings = benchmark_policy(trt_vl_components_module, (inputs,), {}, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
     return model
 
 def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, state: Optional[torch.Tensor] = None):
@@ -288,6 +300,11 @@ def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, stat
 
     eval_outputs(model.state_encoder, trt_state_encoder, (action_input_state, embodiment_id), args)
 
+    if args.benchmark and args.fn_name == "state_encoder":
+        pyt_timings = benchmark_policy(model.state_encoder, (action_input_state, embodiment_id), {}, args=args)
+        trt_timings = benchmark_policy(trt_state_encoder, (action_input_state, embodiment_id), {}, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
     return trt_state_encoder
 
 def compile_action_encoder(model: torch.nn.Module, args: argparse.Namespace):
@@ -313,6 +330,11 @@ def compile_action_encoder(model: torch.nn.Module, args: argparse.Namespace):
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_action_encoder(action_inputs, timesteps, embodiment_id)
     eval_outputs(model.action_encoder, trt_action_encoder, (action_inputs, timesteps, embodiment_id), args)
+
+    if args.benchmark and args.fn_name == "action_encoder":
+        pyt_timings = benchmark_policy(model.action_encoder, (action_inputs, timesteps, embodiment_id), {}, args=args)
+        trt_timings = benchmark_policy(trt_action_encoder, (action_inputs, timesteps, embodiment_id), {}, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
 
     return trt_action_encoder
 
@@ -364,6 +386,11 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
 
     eval_outputs(model.model, trt_dit_model, kwarg_inputs, args)
 
+    if args.benchmark and args.fn_name == "dit_model":
+        pyt_timings = benchmark_policy(model.model, (), kwarg_inputs, args=args)
+        trt_timings = benchmark_policy(trt_dit_model, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
     return trt_dit_model
 
 def compile_action_decoder(model: torch.nn.Module, args: argparse.Namespace, state: Optional[torch.Tensor] = None):
@@ -393,6 +420,11 @@ def compile_action_decoder(model: torch.nn.Module, args: argparse.Namespace, sta
         trt_action_decoder(hidden_states, embodiment_id)
     
     eval_outputs(model.action_decoder, trt_action_decoder, (hidden_states, embodiment_id), args)
+
+    if args.benchmark and args.fn_name == "action_decoder":
+        pyt_timings = benchmark_policy(model.action_decoder, (hidden_states, embodiment_id), {}, args=args)
+        trt_timings = benchmark_policy(trt_action_decoder, (hidden_states, embodiment_id), {}, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
 
     return trt_action_decoder
 
@@ -445,9 +477,17 @@ def get_compilation_args(args: argparse.Namespace):
         enabled_precisions={get_torch_dtype(args.precision)}
     
     full_compilation_args = {}
-    full_compilation_args.update(COMMON_COMPILATION_ARGS)
     full_compilation_args.update({"enabled_precisions": enabled_precisions})
     full_compilation_args.update({"min_block_size": 1})
+    
+    if args.disable_tf32:
+        full_compilation_args.update({"disable_tf32": args.disable_tf32})
+
+    if args.use_cpp_runtime:
+        full_compilation_args.update({"use_python_runtime": not args.use_cpp_runtime})
+    else:
+        full_compilation_args.update({"use_python_runtime": True})
+
     if args.use_explicit_typing:
         full_compilation_args.update({"use_explicit_typing": args.use_explicit_typing})
     if args.use_fp32_acc:
@@ -536,106 +576,6 @@ def get_input_info(policy, observations):
 
     return normalized_input["eagle_attention_mask"], normalized_input["state"]
 
-def benchmark_policy(policy, step_data, num_iterations=10, warmup_iterations=3):
-    """
-    Benchmark the policy inference performance.
-    
-    Args:
-        policy: The Groot policy to benchmark
-        step_data: The input data for inference
-        num_iterations: Number of iterations to run for benchmarking
-        warmup_iterations: Number of warmup iterations before benchmarking
-    
-    Returns:
-        Dict containing benchmark results
-    """
-    import time
-    
-    print(f"Running warmup for {warmup_iterations} iterations...")
-    # Warmup iterations
-    for i in range(warmup_iterations):
-        with torch.inference_mode(), torch.no_grad():
-            _ = policy.get_action(step_data, use_position_ids=True)
-    
-    print(f"Running benchmark for {num_iterations} iterations...")
-    # Benchmark iterations
-    times = []
-    for i in range(num_iterations):
-        with torch.inference_mode(), torch.no_grad():
-            start_time = time.time()
-            predicted_action = policy.get_action(step_data, use_position_ids=True)
-            end_time = time.time()
-            times.append(end_time - start_time)
-    
-    # Calculate statistics
-    avg_time = np.mean(times)
-    min_time = np.min(times)
-    max_time = np.max(times)
-    std_time = np.std(times)
-    
-    # Convert to milliseconds for reporting
-    avg_time_ms = avg_time * 1000
-    min_time_ms = min_time * 1000
-    max_time_ms = max_time * 1000
-    std_time_ms = std_time * 1000
-    
-    print(f"\nBenchmark Results:")
-    print(f"Average inference time: {avg_time_ms:.2f} milliseconds")
-    print(f"Min inference time: {min_time_ms:.2f} milliseconds")
-    print(f"Max inference time: {max_time_ms:.2f} milliseconds")
-    print(f"Standard deviation: {std_time_ms:.2f} milliseconds")
-    print(f"Throughput: {1.0/avg_time:.2f} FPS")
-    
-    return {
-        "avg_time": avg_time_ms,
-        "min_time": min_time_ms,
-        "max_time": max_time_ms,
-        "std_time": std_time_ms,
-        "throughput": 1.0/avg_time,
-        "predicted_action": predicted_action
-    }
-
-
-def compare_benchmark_outputs(pyt_timings, trt_timings):
-    """
-    Compare the benchmark outputs between PyTorch and TensorRT models.
-    
-    Args:
-        pyt_timings: Dictionary containing PyTorch benchmark results
-        trt_timings: Dictionary containing TensorRT benchmark results
-    """
-    print("\n" + "="*60)
-    print("BENCHMARK COMPARISON (PyTorch vs TensorRT)")
-    print("="*60)
-    
-    # Calculate speedup metrics
-    speedup = pyt_timings["avg_time"] / trt_timings["avg_time"]
-    throughput_improvement = (trt_timings["throughput"] - pyt_timings["throughput"]) / pyt_timings["throughput"] * 100
-    
-    # Format and display comparison
-    max_label_width = 35
-    
-    print(f'{"Average Inference Time:".ljust(max_label_width)} PyTorch: {pyt_timings["avg_time"]:.4f}s | TensorRT: {trt_timings["avg_time"]:.4f}s')
-    print(f'{"Min Inference Time:".ljust(max_label_width)} PyTorch: {pyt_timings["min_time"]:.4f}s | TensorRT: {trt_timings["min_time"]:.4f}s')
-    print(f'{"Max Inference Time:".ljust(max_label_width)} PyTorch: {pyt_timings["max_time"]:.4f}s | TensorRT: {trt_timings["max_time"]:.4f}s')
-    print(f'{"Standard Deviation:".ljust(max_label_width)} PyTorch: {pyt_timings["std_time"]:.4f}s | TensorRT: {trt_timings["std_time"]:.4f}s')
-    print(f'{"Throughput (FPS):".ljust(max_label_width)} PyTorch: {pyt_timings["throughput"]:.2f} | TensorRT: {trt_timings["throughput"]:.2f}')
-    
-    print("\n" + "-"*60)
-    print("PERFORMANCE IMPROVEMENTS")
-    print("-"*60)
-    print(f'{"Speedup (x faster):".ljust(max_label_width)} {speedup:.2f}x')
-    print(f'{"Throughput Improvement:".ljust(max_label_width)} {throughput_improvement:.1f}%')
-    
-    if speedup > 1.0:
-        print(f'{"Result:".ljust(max_label_width)} TensorRT is {speedup:.2f}x faster than PyTorch')
-    else:
-        print(f'{"Result:".ljust(max_label_width)} PyTorch is {1/speedup:.2f}x faster than TensorRT')
-    
-    print("="*60)
-
-
-
 def run_groot_inference(
     args: argparse.Namespace
 ) -> Dict[str, float]:
@@ -663,11 +603,17 @@ def run_groot_inference(
         # Run pytorch inference and get the predicted action
         pyt_predicted_action = policy.get_action(step_data, use_position_ids=True)
         attention_mask, state = get_input_info(policy, step_data)
-        pyt_timings = benchmark_policy(policy, step_data, num_iterations=5, warmup_iterations=1)
+        
 
         if args.fn_name == "eagle_backbone":
             trt_eagle_backbone = compile_eagle_backbone(model.backbone.eagle_model, args, attention_mask=attention_mask)
             model.backbone.eagle_model = trt_eagle_backbone
+        elif args.fn_name == "vision_model":
+            trt_vision_model = compile_vision_model(model.backbone.eagle_model.vision_model, args)
+            model.backbone.eagle_model.vision_model = trt_vision_model
+        elif args.fn_name == "language_model":
+            trt_language_model = compile_language_model(model.backbone.eagle_model.language_model, args, attention_mask=attention_mask)
+            model.backbone.eagle_model.language_model = trt_language_model
         elif args.fn_name == "vl_components":
             trt_vl_components = compile_vl_components(model.action_head, args, attention_mask=attention_mask)
             model.action_head = trt_vl_components
@@ -687,29 +633,37 @@ def run_groot_inference(
             trt_action_head = compile_action_head(model.action_head, args, attention_mask=attention_mask, state=state)
             model.action_head = trt_action_head
         elif args.fn_name == "all":
+            if args.benchmark:
+                pyt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args=args)
+
             trt_eagle_backbone = compile_eagle_backbone(model.backbone.eagle_model, args)
             model.backbone.eagle_model = trt_eagle_backbone
 
             trt_action_head = compile_action_head(model.action_head, args, attention_mask=attention_mask, state=state)
             model.action_head = trt_action_head
+
+            # Replace the model in the policy with the Torch-TensorRT compiled model
+            policy.model = model
+            # Run the Torch-TensorRT compiled model and get the predicted action
+            trt_predicted_action = policy.get_action(step_data, use_position_ids=True)
+
+            if args.benchmark:
+                trt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args=args)
+
+            # Evaluate the difference between the PyTorch and Torch-TensorRT models
+            compare_predictions(pyt_predicted_action, trt_predicted_action)
+
+            # Compare the performance of the PyTorch and Torch-TensorRT models
+            if args.benchmark:
+                compare_benchmark_outputs(pyt_timings, trt_timings)
+
         else:
             print("No component is compiled with Torch-TensorRT. Running PyTorch inference.")
 
-        # Replace the model in the policy with the Torch-TensorRT compiled model
-        policy.model = model
-        # Run the Torch-TensorRT compiled model and get the predicted action
-        trt_predicted_action = policy.get_action(step_data, use_position_ids=True)
-        trt_timings = benchmark_policy(policy, step_data, num_iterations=5, warmup_iterations=1)
-
-        # Evaluate the difference between the PyTorch and Torch-TensorRT models
-        compare_predictions(pyt_predicted_action, trt_predicted_action)
-
-        # Compare the performance of the PyTorch and Torch-TensorRT models
-        compare_benchmark_outputs(pyt_timings, trt_timings)
 
         print("=========Groot N1.5 3B inference complete=========")
 
-    return trt_predicted_action
+    
 
 if __name__ == "__main__":
     # Make sure you have logged in to huggingface using `huggingface-cli login` with your nvidia email.
@@ -764,6 +718,12 @@ if __name__ == "__main__":
         "--debug", action="store_true", help="Enable debug mode (default: False)"
     )
     parser.add_argument(
+        "--use_cpp_runtime", action="store_true", help="Enable cpp runtime (default: False)"
+    )
+    parser.add_argument(
+        "--disable_tf32", action="store_true", help="Disable tf32 (default: False)"
+    )
+    parser.add_argument(
         "--eval", action="store_true", help="Evaluate the outputs of the model (default: False)"
     )
     parser.add_argument(
@@ -771,6 +731,24 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_explicit_typing", action="store_true", help="Enable explicit typing (default: False)"
+    )
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        help="cuda_event or python_timer",
+        default="cuda_event",
+    )
+    parser.add_argument(
+        "--num_iterations",
+        type=int,
+        help="Number of iterations to run for benchmarking",
+        default=10,
+    )
+    parser.add_argument(
+        "--warmup_iterations",
+        type=int,
+        help="Number of warmup iterations to run for benchmarking",
+        default=5,
     )
     parser.add_argument(
         "--device",
@@ -784,4 +762,6 @@ if __name__ == "__main__":
     print(f"Dataset path: {args.dataset_path}")
     print(f"Model path: {args.model_path}")
     print(f"ONNX model path: {args.onnx_model_path}")
-    predicted_action = run_groot_inference(args)
+
+    # Run the Groot inference
+    run_groot_inference(args)
