@@ -601,7 +601,7 @@ def run_groot_inference(
         model=policy.model.eval().to(args.device).to(get_torch_dtype(args.precision))
 
         # Run pytorch inference and get the predicted action
-        pyt_predicted_action = policy.get_action(step_data, use_position_ids=True)
+        pyt_predicted_action = policy.get_action(step_data) 
         attention_mask, state = get_input_info(policy, step_data)
         
 
@@ -648,7 +648,7 @@ def run_groot_inference(
             trt_predicted_action = policy.get_action(step_data, use_position_ids=True)
 
             if args.benchmark:
-                trt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args=args)
+                trt_timings = benchmark_policy(policy.get_action, (step_data,), {"use_position_ids": True}, args=args)
 
             # Evaluate the difference between the PyTorch and Torch-TensorRT models
             compare_predictions(pyt_predicted_action, trt_predicted_action)
@@ -682,12 +682,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--onnx_model_path",
-        type=str,
-        help="Path where the ONNX model will be stored",
-        default=os.path.join(os.getcwd(), "gr00t_onnx"),
-    )
-    parser.add_argument(
         "--precision",
         type=str,
         help="FP16 or FP32",
@@ -697,7 +691,7 @@ if __name__ == "__main__":
         "--denoising_steps",
         type=int,
         help="Number of denoising steps",
-        default=1,
+        default=4,
     )
     parser.add_argument(
         "--fn_name",
@@ -761,7 +755,6 @@ if __name__ == "__main__":
 
     print(f"Dataset path: {args.dataset_path}")
     print(f"Model path: {args.model_path}")
-    print(f"ONNX model path: {args.onnx_model_path}")
 
     # Run the Groot inference
     run_groot_inference(args)

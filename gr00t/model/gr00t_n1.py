@@ -176,6 +176,8 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         if use_position_ids:
             self.backbone.use_position_ids = True
+        else:
+            self.backbone.use_position_ids = False
             
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
