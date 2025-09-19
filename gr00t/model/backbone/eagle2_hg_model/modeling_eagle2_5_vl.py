@@ -245,16 +245,17 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
 
         input_ids = input_ids.reshape(B * N)
         selected = input_ids == self.image_token_index
-        try:
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-        except Exception as e:
-            vit_embeds = vit_embeds.reshape(-1, C)
-            print(
-                f"warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, "
-                f"vit_embeds.shape={vit_embeds.shape}"
-            )
-            n_token = selected.sum()
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
+        input_embeds[selected] = vit_embeds.reshape(-1, C)
+        # try:
+        #     input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
+        # except Exception as e:
+        #     vit_embeds = vit_embeds.reshape(-1, C)
+        #     print(
+        #         f"warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, "
+        #         f"vit_embeds.shape={vit_embeds.shape}"
+        #     )
+        #     n_token = selected.sum()
+        #     input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
 
         input_embeds = input_embeds.reshape(B, N, C)
 

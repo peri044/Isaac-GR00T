@@ -12,6 +12,13 @@ from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from functools import partial
 from typing import Any, Optional
 from utils import benchmark_policy, compare_benchmark_outputs
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers.models.siglip.modeling_siglip import (
+    SiglipVisionEmbeddings,
+    SiglipVisionTransformer,
+)
+from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
 def get_groot_policy(args: argparse.Namespace):
     """
@@ -96,10 +103,153 @@ def eval_outputs(pyt_model, trt_model, inputs, args: argparse.Namespace):
             print("Diff: ", torch.mean(torch.abs(pyt_output[1][-1] - trt_output[1][-1])))
             print("Diff: ", torch.mean(torch.abs(pyt_output[0] - trt_output[0])))
 
+def get_onnx_vit_model(vision_model, args: argparse.Namespace):
+    """
+    Get the ONNX version of the Vision Transformer model.
+    """
+    class SiglipVisionEmbeddingsOpt(SiglipVisionEmbeddings):
+        def __init__(self, config):
+            super().__init__(config)
+
+        def forward(
+            self,
+            pixel_values: torch.FloatTensor,
+            position_ids: torch.LongTensor,  # position_ids is now an input
+            interpolate_pos_encoding=False,
+        ) -> torch.Tensor:
+            _, _, height, width = pixel_values.shape
+            target_dtype = self.patch_embedding.weight.dtype
+            patch_embeds = self.patch_embedding(
+                pixel_values.to(dtype=target_dtype)
+            )  # shape = [*, width, grid, grid]
+            embeddings = patch_embeds.flatten(2).transpose(1, 2)
+
+            if interpolate_pos_encoding:
+                embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
+            else:
+                embeddings = embeddings + self.position_embedding(position_ids)
+            return embeddings
+
+    class SiglipVisionTransformerOpt(SiglipVisionTransformer):
+        def __init__(self, config: SiglipVisionConfig):
+            config._attn_implementation = "sdpa"
+            super().__init__(config)
+            self.embeddings = SiglipVisionEmbeddingsOpt(config)
+
+        def forward(
+            self,
+            pixel_values,
+            position_ids,  # Pass position_ids as input
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            interpolate_pos_encoding: Optional[bool] = False,
+        ):
+            output_attentions = (
+                output_attentions
+                if output_attentions is not None
+                else self.config.output_attentions
+            )
+            output_hidden_states = (
+                output_hidden_states
+                if output_hidden_states is not None
+                else self.config.output_hidden_states
+            )
+
+            hidden_states = self.embeddings(
+                pixel_values,
+                position_ids=position_ids,
+                interpolate_pos_encoding=interpolate_pos_encoding,
+            )
+
+            encoder_outputs = self.encoder(
+                inputs_embeds=hidden_states,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            # return encoder_outputs
+            last_hidden_state = encoder_outputs.last_hidden_state
+            last_hidden_state = self.post_layernorm(last_hidden_state)
+
+            return last_hidden_state
+
+    model = SiglipVisionTransformerOpt(vision_model.config).to(torch.float16)
+    
+    # Strip the "vision_model." prefix from state_dict keys
+    state_dict = vision_model.state_dict()
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("vision_model."):
+            new_key = key[len("vision_model."):]  # Remove "vision_model." prefix
+            new_state_dict[new_key] = value
+        else:
+            new_state_dict[key] = value
+    
+    model.load_state_dict(new_state_dict)
+    model.eval().cuda()
+
+    return model
+
+def compile_onnx_vit_model(model, args: argparse.Namespace):
+    """
+    Compile the ONNX version of the Vision Transformer model.
+
+    Args:
+        vision_model: The Vision Transformer model
+
+    Returns:
+        The compiled ONNX version of the Vision Transformer model
+    """
+
+    BATCH_SIZE = 2
+    pixel_values = torch.randn(
+        (BATCH_SIZE, model.config.num_channels, model.config.image_size, model.config.image_size),
+        dtype=torch.float16,
+        device="cuda",
+    )
+    position_ids = torch.arange(model.embeddings.num_patches, device="cuda").expand((BATCH_SIZE, -1))
+
+    kwarg_inputs = {
+        "pixel_values": pixel_values,
+        "position_ids": position_ids,
+        "output_hidden_states": False,
+        # "return_dict": True,
+    }
+    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
+    kwarg_dynamic_shapes = {
+        "pixel_values": {0: BATCH_DIM},
+        "position_ids": {0: BATCH_DIM},
+        "output_hidden_states": None,
+        # "return_dict": None,
+    }
+
+    settings = get_compilation_args(args)
+    trt_vision_model = torch_tensorrt.MutableTorchTensorRTModule(model, **settings)
+    trt_vision_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
+    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
+        trt_vision_model(**kwarg_inputs)
+
+    eval_outputs(model, trt_vision_model, kwarg_inputs, args)
+
+    if args.benchmark and args.fn_name == "vision_model":
+        pyt_timings = benchmark_policy(model, (), kwarg_inputs, args=args)
+        trt_timings = benchmark_policy(trt_vision_model, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
+    return trt_vision_model
+
 def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace):
     """
     Compile the vision model of the eagle backbone using Torch-TensorRT.
     """
+    if args.use_onnx_vit:
+        trt_vision_model = compile_onnx_vit_model(vision_model, args)
+        return trt_vision_model
+
+    # This setting is specific to Eagle2.5VL model which uses SiglipVisionModel as the vision model.
+    # The use_head adds a multi-attention head on the encoder outputs which isn't used in Eagle2.5VL model
+    # and hence we set the use_head flag to False to avoid the latency introduced by the head.
+    vision_model.vision_model.use_head = False
+
     BATCH_SIZE = 2
     NUM_CHANNELS = vision_model.config.num_channels
     IMAGE_SIZE = vision_model.config.image_size
@@ -175,9 +325,33 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
 
     return trt_language_model
 
+# def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
+#     """
+#     Compile the eagle backbone's vision model and language model separately using Torch-TensorRT.
+
+#     Args:
+#         eagle_backbone: The eagle backbone of the GR00T model
+#         args: The arguments for the compilation
+
+#     Returns:
+#         The compiled eagle backbone
+#     """
+#     eagle_backbone.vision_model.config._attn_implementation = "sdpa"
+#     eagle_backbone.language_model.config._attn_implementation = "sdpa"
+
+#     # Compile the vision model
+#     trt_vision_model = compile_vision_model(eagle_backbone.vision_model, args)
+#     eagle_backbone.vision_model = trt_vision_model
+
+#     # Compile the language model
+#     trt_language_model = compile_language_model(eagle_backbone.language_model, args, attention_mask=attention_mask)
+#     eagle_backbone.language_model = trt_language_model
+
+#     return eagle_backbone
+
 def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
     """
-    Compile the eagle backbone's vision model and language model separately using Torch-TensorRT.
+    Compile the eagle backbone's vision model and language model by exporting them jointly using Torch-TensorRT.
 
     Args:
         eagle_backbone: The eagle backbone of the GR00T model
@@ -188,16 +362,59 @@ def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Names
     """
     eagle_backbone.vision_model.config._attn_implementation = "sdpa"
     eagle_backbone.language_model.config._attn_implementation = "sdpa"
+    # This setting is specific to Eagle2.5VL model which uses SiglipVisionModel as the vision model.
+    # The use_head adds a multi-attention head on the encoder outputs which isn't used in Eagle2.5VL model
+    # and hence we set the use_head flag to False to avoid the latency introduced by the head.
+    eagle_backbone.vision_model.vision_model.use_head = False
+    # breakpoint()
+    # eagle_backbone.use_position_ids = True
 
-    # Compile the vision model
-    trt_vision_model = compile_vision_model(eagle_backbone.vision_model, args)
-    eagle_backbone.vision_model = trt_vision_model
+    # Define kwarg inputs and dynamic shapes
+    BATCH_SIZE = 2
+    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 294
+    HIDDEN_SIZE = 2048
+    NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
+    IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
+    input_ids = torch.randint(100, (BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
+    position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
+    pixel_values = torch.randn(
+        (BATCH_SIZE, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
+        dtype=get_torch_dtype(args.precision),
+        device=args.device,
+    )
+    kwarg_inputs = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "output_hidden_states": True,
+        "pixel_values": pixel_values,
+        "return_dict": True,
+    }
 
-    # Compile the language model
-    trt_language_model = compile_language_model(eagle_backbone.language_model, args, attention_mask=attention_mask)
-    eagle_backbone.language_model = trt_language_model
+    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=1024)
+    kwarg_dynamic_shapes = {
+        "input_ids": {0: BATCH_DIM, 1: SEQ_LEN_DIM},
+        "position_ids": {0: BATCH_DIM, 1: SEQ_LEN_DIM},
+        "output_hidden_states": None,
+        "pixel_values": {0: BATCH_DIM},
+        "return_dict": None,
+    }
+    settings = get_compilation_args(args)
+    
+    trt_eagle_backbone = torch_tensorrt.MutableTorchTensorRTModule(eagle_backbone, **settings)
+    trt_eagle_backbone.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
 
-    return eagle_backbone
+    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
+        trt_eagle_backbone(**kwarg_inputs)
+    
+    eval_outputs(eagle_backbone, trt_eagle_backbone, kwarg_inputs, args)
+
+    if args.benchmark and args.fn_name == "eagle_backbone":
+        pyt_timings = benchmark_policy(eagle_backbone, (), kwarg_inputs, args=args)
+        trt_timings = benchmark_policy(trt_eagle_backbone, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
+    return trt_eagle_backbone
 
 class VLComponents(torch.nn.Module):
     """
@@ -272,6 +489,56 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
 
     return model
 
+# class CategorySpecificLinear(nn.Module):
+#     def __init__(self, num_categories, input_dim, hidden_dim):
+#         super().__init__()
+#         self.num_categories = num_categories
+#         # For each category, we have separate weights and biases.
+#         self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
+#         self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
+
+#     def forward(self, x, cat_ids):
+#         selected_W = self.W[cat_ids]
+#         selected_b = self.b[cat_ids]
+#         return 2 * x + 3 #torch.bmm(x, selected_W) #+ selected_b.unsqueeze(1)
+
+
+# class CategorySpecificMLP(nn.Module):
+#     def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
+#         super().__init__()
+#         self.num_categories = num_categories
+#         self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+#         self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+#     def forward(self, x, cat_ids):
+#         # hidden = F.relu(self.layer1(x, cat_ids))
+#         return self.layer1(x, cat_ids) #self.layer2(hidden, cat_ids)
+
+class CategorySpecificLinear(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim):
+        super().__init__()
+        self.num_categories = num_categories
+        # For each category, we have separate weights and biases.
+        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
+        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
+
+    def forward(self, x, cat_ids):
+        selected_W = self.W[cat_ids]
+        selected_b = self.b[cat_ids]
+        return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
+
+
+class CategorySpecificMLP(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.num_categories = num_categories
+        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+    def forward(self, x, cat_ids):
+        hidden = F.relu(self.layer1(x, cat_ids))
+        return self.layer2(hidden, cat_ids)
+
 def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, state: Optional[torch.Tensor] = None):
     """
     Compile the state encoder of the GrootN1.5 model using Torch-TensorRT.
@@ -280,6 +547,7 @@ def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, stat
         model: The action head of the GR00T model
         device: Device to run compilation on (default: "cuda")
     """
+    
     BATCH_SIZE = 2
     H, W = 1, 64
     if state is not None:
@@ -498,8 +766,10 @@ def get_compilation_args(args: argparse.Namespace):
         full_compilation_args.update({"offload_module_to_cpu": args.cpu_offload})
     
     full_compilation_args.update({"allow_complex_guards_as_runtime_asserts": True})
+    full_compilation_args.update({"prefer_deferred_runtime_asserts_over_guards": True})
     full_compilation_args.update({"strict": False})
     full_compilation_args.update({"require_full_compilation": True})
+    full_compilation_args.update({"truncate_double": True})
     return full_compilation_args
 
 def compare_predictions(pred_tensorrt, pred_torch):
@@ -600,11 +870,13 @@ def run_groot_inference(
         # Set the model to evaluation mode and move it to the specified device with the correct precision
         model=policy.model.eval().to(args.device).to(get_torch_dtype(args.precision))
 
-        # Run pytorch inference and get the predicted action
-        pyt_predicted_action = policy.get_action(step_data) 
+        # model.action_head.state_encoder = CategorySpecificMLP(32, 64, 1024, 1536).eval().to(args.device).to(get_torch_dtype(args.precision))
+        
+        if args.use_onnx_vit:
+            model.backbone.eagle_model.vision_model = get_onnx_vit_model(model.backbone.eagle_model.vision_model, args)
+        # Get the input info
         attention_mask, state = get_input_info(policy, step_data)
         
-
         if args.fn_name == "eagle_backbone":
             trt_eagle_backbone = compile_eagle_backbone(model.backbone.eagle_model, args, attention_mask=attention_mask)
             model.backbone.eagle_model = trt_eagle_backbone
@@ -633,6 +905,9 @@ def run_groot_inference(
             trt_action_head = compile_action_head(model.action_head, args, attention_mask=attention_mask, state=state)
             model.action_head = trt_action_head
         elif args.fn_name == "all":
+            # Run pytorch inference and get the predicted action
+            pyt_predicted_action = policy.get_action(step_data)
+
             if args.benchmark:
                 pyt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args=args)
 
@@ -725,6 +1000,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_explicit_typing", action="store_true", help="Enable explicit typing (default: False)"
+    )
+    parser.add_argument(
+        "--use_onnx_vit", action="store_true", help="Use ONNX version of the Vision Transformer model (default: False)"
     )
     parser.add_argument(
         "--benchmark",
