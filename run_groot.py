@@ -20,6 +20,13 @@ from transformers.models.siglip.modeling_siglip import (
 )
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
+# To run trtexec on TRT engines,
+# trtexec --loadEngine=gr00t_engine/state_encoder.engine --shapes='state:1x1x64,embodiment_id:1'
+# trtexec --loadEngine=gr00t_engine/action_encoder.engine --shapes='actions:1x16x32,timesteps_tensor:1,embodiment_id:1 
+
+# Use this command to run this script:
+# python run_groot.py --precision FP16 --use_fp32_acc --use_explicit_typing --fn_name all  --benchmark cuda_event --use_eagle_backbone_joint
+
 def get_groot_policy(args: argparse.Namespace):
     """
     Get the Groot policy. Change the attention implementation to SDPA.
@@ -241,6 +248,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
     """
     Compile the vision model of the eagle backbone using Torch-TensorRT.
     """
+
     if args.use_onnx_vit:
         trt_vision_model = compile_onnx_vit_model(vision_model, args)
         return trt_vision_model
@@ -250,7 +258,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
     # and hence we set the use_head flag to False to avoid the latency introduced by the head.
     vision_model.vision_model.use_head = False
 
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     NUM_CHANNELS = vision_model.config.num_channels
     IMAGE_SIZE = vision_model.config.image_size
     pixel_values = torch.randn(
@@ -263,17 +271,17 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
         "output_hidden_states": False,
         # "return_dict": True,
     }
-    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    kwarg_dynamic_shapes = {
-        "pixel_values": {0: BATCH_DIM},
-        "output_hidden_states": None,
-        # "return_dict": None,
-    }
+    # Enable this if you need dynamic batch size
+    # BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
+    # kwarg_dynamic_shapes = {
+    #     "pixel_values": {0: BATCH_DIM},
+    #     "output_hidden_states": None,
+    #     # "return_dict": None,
+    # }
 
     settings = get_compilation_args(args)
     settings.update({"allow_complex_guards_as_runtime_asserts": True})
     trt_vision_model = torch_tensorrt.MutableTorchTensorRTModule(vision_model, **settings)
-    trt_vision_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_vision_model(**kwarg_inputs)
     
@@ -290,7 +298,7 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     """
     Compile the language model of the eagle backbone using Torch-TensorRT.
     """
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 294
     HIDDEN_SIZE = 2048
     inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
@@ -302,10 +310,10 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     }
 
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=1024)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=300)
     kwarg_dynamic_shapes = {
-        "inputs_embeds": {0: BATCH_DIM, 1: SEQ_LEN_DIM},
-        "position_ids": {0: BATCH_DIM, 1: SEQ_LEN_DIM},
+        "inputs_embeds": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
+        "position_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
         "output_hidden_states": None,
     }
 
@@ -317,7 +325,7 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
         trt_language_model(**kwarg_inputs)
     
     eval_outputs(language_model, trt_language_model, kwarg_inputs, args)
-
+ 
     if args.benchmark and args.fn_name == "language_model":
         pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
         trt_timings = benchmark_policy(trt_language_model, (), kwarg_inputs, args=args)
@@ -325,31 +333,34 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
 
     return trt_language_model
 
-# def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
-#     """
-#     Compile the eagle backbone's vision model and language model separately using Torch-TensorRT.
-
-#     Args:
-#         eagle_backbone: The eagle backbone of the GR00T model
-#         args: The arguments for the compilation
-
-#     Returns:
-#         The compiled eagle backbone
-#     """
-#     eagle_backbone.vision_model.config._attn_implementation = "sdpa"
-#     eagle_backbone.language_model.config._attn_implementation = "sdpa"
-
-#     # Compile the vision model
-#     trt_vision_model = compile_vision_model(eagle_backbone.vision_model, args)
-#     eagle_backbone.vision_model = trt_vision_model
-
-#     # Compile the language model
-#     trt_language_model = compile_language_model(eagle_backbone.language_model, args, attention_mask=attention_mask)
-#     eagle_backbone.language_model = trt_language_model
-
-#     return eagle_backbone
-
 def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
+    """
+    Compile the eagle backbone's vision model and language model separately using Torch-TensorRT.
+
+    Args:
+        eagle_backbone: The eagle backbone of the GR00T model
+        args: The arguments for the compilation
+
+    Returns:
+        The compiled eagle backbone
+    """
+    if args.use_eagle_backbone_joint:
+        return compile_eagle_backbone_joint(eagle_backbone, args, attention_mask=attention_mask)
+
+    eagle_backbone.vision_model.config._attn_implementation = "sdpa"
+    eagle_backbone.language_model.config._attn_implementation = "sdpa"
+
+    # Compile the vision model
+    trt_vision_model = compile_vision_model(eagle_backbone.vision_model, args)
+    eagle_backbone.vision_model = trt_vision_model
+
+    # Compile the language model
+    trt_language_model = compile_language_model(eagle_backbone.language_model, args, attention_mask=attention_mask)
+    eagle_backbone.language_model = trt_language_model
+
+    return eagle_backbone
+
+def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
     """
     Compile the eagle backbone's vision model and language model by exporting them jointly using Torch-TensorRT.
 
@@ -366,22 +377,25 @@ def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Names
     # The use_head adds a multi-attention head on the encoder outputs which isn't used in Eagle2.5VL model
     # and hence we set the use_head flag to False to avoid the latency introduced by the head.
     eagle_backbone.vision_model.vision_model.use_head = False
-    # breakpoint()
-    # eagle_backbone.use_position_ids = True
+
 
     # Define kwarg inputs and dynamic shapes
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 294
     HIDDEN_SIZE = 2048
     NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
     IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
-    input_ids = torch.randint(100, (BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
+    # The following inputs cannot be random since there is index_put in the graph and it goes out of bounds if the input is random.
+    # input_ids = torch.randint(100, (BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
+    # position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
+    # pixel_values = torch.randn(
+    #     (BATCH_SIZE, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
+    #     dtype=get_torch_dtype(args.precision),
+    #     device=args.device,
+    # )
+    input_ids = torch.load('egb_input_ids.pt').to(args.device)
     position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
-    pixel_values = torch.randn(
-        (BATCH_SIZE, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
-        dtype=get_torch_dtype(args.precision),
-        device=args.device,
-    )
+    pixel_values = torch.load('egb_pixel_values.pt').to(args.device)
     kwarg_inputs = {
         "input_ids": input_ids,
         "position_ids": position_ids,
@@ -391,12 +405,12 @@ def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Names
     }
 
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=1024)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=300)
     kwarg_dynamic_shapes = {
-        "input_ids": {0: BATCH_DIM, 1: SEQ_LEN_DIM},
-        "position_ids": {0: BATCH_DIM, 1: SEQ_LEN_DIM},
+        "input_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM
+        "position_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM
         "output_hidden_states": None,
-        "pixel_values": {0: BATCH_DIM},
+        "pixel_values": None, # 0: BATCH_DIM
         "return_dict": None,
     }
     settings = get_compilation_args(args)
@@ -451,9 +465,10 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
     Returns:
         Tuple of compiled TensorRT versions of the vlln and vl_self_attention components
     """
-    batch_size = 2
+    batch_size = 1
     hidden_dim = model.config.backbone_embedding_dim
     seq_len = attention_mask.shape[1] if attention_mask is not None else 294
+    # 1 x 294 x 2048
     inputs = torch.randn(
         (batch_size, seq_len, hidden_dim),
         dtype=get_torch_dtype(args.precision),
@@ -461,7 +476,7 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
     )
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
     SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=1024)
-    dynamic_shapes = ({0: BATCH_DIM, 1: SEQ_LEN_DIM},)
+    dynamic_shapes = ({1: SEQ_LEN_DIM},) # 0: BATCH_DIM
 
     vl_components_module = VLComponents(model.vlln, model.vl_self_attention)
     # Compile the vlln
@@ -489,56 +504,6 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
 
     return model
 
-# class CategorySpecificLinear(nn.Module):
-#     def __init__(self, num_categories, input_dim, hidden_dim):
-#         super().__init__()
-#         self.num_categories = num_categories
-#         # For each category, we have separate weights and biases.
-#         self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
-#         self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
-
-#     def forward(self, x, cat_ids):
-#         selected_W = self.W[cat_ids]
-#         selected_b = self.b[cat_ids]
-#         return 2 * x + 3 #torch.bmm(x, selected_W) #+ selected_b.unsqueeze(1)
-
-
-# class CategorySpecificMLP(nn.Module):
-#     def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
-#         super().__init__()
-#         self.num_categories = num_categories
-#         self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
-#         self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
-
-#     def forward(self, x, cat_ids):
-#         # hidden = F.relu(self.layer1(x, cat_ids))
-#         return self.layer1(x, cat_ids) #self.layer2(hidden, cat_ids)
-
-class CategorySpecificLinear(nn.Module):
-    def __init__(self, num_categories, input_dim, hidden_dim):
-        super().__init__()
-        self.num_categories = num_categories
-        # For each category, we have separate weights and biases.
-        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
-        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
-
-    def forward(self, x, cat_ids):
-        selected_W = self.W[cat_ids]
-        selected_b = self.b[cat_ids]
-        return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
-
-
-class CategorySpecificMLP(nn.Module):
-    def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.num_categories = num_categories
-        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
-        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
-
-    def forward(self, x, cat_ids):
-        hidden = F.relu(self.layer1(x, cat_ids))
-        return self.layer2(hidden, cat_ids)
-
 def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, state: Optional[torch.Tensor] = None):
     """
     Compile the state encoder of the GrootN1.5 model using Torch-TensorRT.
@@ -548,7 +513,7 @@ def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, stat
         device: Device to run compilation on (default: "cuda")
     """
     
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     H, W = 1, 64
     if state is not None:
         H, W = state.shape[1], state.shape[2]
@@ -558,11 +523,12 @@ def compile_state_encoder(model: torch.nn.Module, args: argparse.Namespace, stat
         device=args.device,
     )
 
-    embodiment_id = torch.tensor([24, 24], dtype=torch.int64, device=args.device)
+    embodiment_id = torch.tensor([24], dtype=torch.int64, device=args.device)
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    dynamic_shapes = ({0: BATCH_DIM}, {0: BATCH_DIM})
+    # dynamic_shapes = ({0: BATCH_DIM}, {0: BATCH_DIM})
     trt_state_encoder = torch_tensorrt.MutableTorchTensorRTModule(model.state_encoder, **get_compilation_args(args))
-    trt_state_encoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
+    # Enable this if you need dynamic batch size
+    # trt_state_encoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_state_encoder(action_input_state, embodiment_id)
 
@@ -583,18 +549,21 @@ def compile_action_encoder(model: torch.nn.Module, args: argparse.Namespace):
         model: The action head of the GR00T model
         device: Device to run compilation on (default: "cuda")
     """
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
+    # Shape is (1, 16, 32)
     action_inputs = torch.randn(
         (BATCH_SIZE, model.config.action_horizon, model.config.action_dim),
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
-    timesteps = torch.tensor([0, 0], dtype=torch.int64, device=args.device)
-    embodiment_id = torch.tensor([24, 24], dtype=torch.int64, device=args.device)
+
+    timesteps = torch.tensor([0], dtype=torch.int64, device=args.device)
+    embodiment_id = torch.tensor([24], dtype=torch.int64, device=args.device)
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    dynamic_shapes = ({0: BATCH_DIM}, {0: BATCH_DIM}, {0: BATCH_DIM})
+    # dynamic_shapes = ({0: BATCH_DIM}, {0: BATCH_DIM}, {0: BATCH_DIM})
     trt_action_encoder = torch_tensorrt.MutableTorchTensorRTModule(model.action_encoder, **get_compilation_args(args))
-    trt_action_encoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
+    # Enable this if you need dynamic batch size
+    # trt_action_encoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_action_encoder(action_inputs, timesteps, embodiment_id)
     eval_outputs(model.action_encoder, trt_action_encoder, (action_inputs, timesteps, embodiment_id), args)
@@ -614,7 +583,7 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
         model: The DIT model to compile
         device: Device to run compilation on (default: "cuda")
     """
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     # Shape is (batch_size, 49, 1536)
     hidden_states = torch.randn(
         (
@@ -628,7 +597,8 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
         device=args.device,
     )
     seq_len = torch.export.Dim("seq_len", min=1, max=1024)
-    batch_dim = torch.export.Dim("batch", min=1, max=8)
+    # Enable this if you need dynamic batch size
+    # batch_dim = torch.export.Dim("batch", min=1, max=8)
     # Shape is (batch_size, 294, 2048)
     encoder_hidden_states = torch.randn(
         (BATCH_SIZE, attention_mask.shape[1], model.config.backbone_embedding_dim),
@@ -636,16 +606,16 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
         device=args.device,
     )
 
-    timestep = torch.tensor([0, 0], dtype=torch.int64, device=args.device)
+    timestep = torch.tensor([0], dtype=torch.int64, device=args.device)
     kwarg_inputs = {
         "hidden_states": hidden_states,
         "encoder_hidden_states": encoder_hidden_states,
         "timestep": timestep,
     }
     kwarg_dynamic_shapes = {
-        "hidden_states": {0: batch_dim},
-        "encoder_hidden_states": {0: batch_dim, 1: seq_len},
-        "timestep": {0: batch_dim},
+        "hidden_states": None, # {0: batch_dim},
+        "encoder_hidden_states": {1: seq_len}, # {0: batch_dim, 1: seq_len},
+        "timestep": None, # {0: batch_dim},
     }
     trt_dit_model = torch_tensorrt.MutableTorchTensorRTModule(model.model, **get_compilation_args(args))
     trt_dit_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
@@ -665,7 +635,7 @@ def compile_action_decoder(model: torch.nn.Module, args: argparse.Namespace, sta
     """
     Compile the action decoder of the GrootN1.5 model using Torch-TensorRT.
     """
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     # Shape is (batch_size, 49, 1024)
     hidden_states = torch.randn(
         (
@@ -678,12 +648,14 @@ def compile_action_decoder(model: torch.nn.Module, args: argparse.Namespace, sta
         dtype=get_torch_dtype(args.precision),
         device=args.device,
     )
-    batch_dim = torch.export.Dim("batch", min=1, max=8)
-    embodiment_id = torch.tensor([24, 24], dtype=torch.int64, device=args.device)
-    dynamic_shapes = ({0: batch_dim},{0: batch_dim})
+    # Enable this if you need dynamic batch size
+    # batch_dim = torch.export.Dim("batch", min=1, max=8)
+    # dynamic_shapes = ({0: batch_dim},{0: batch_dim})
+    embodiment_id = torch.tensor([24], dtype=torch.int64, device=args.device)
+    
 
     trt_action_decoder = torch_tensorrt.MutableTorchTensorRTModule(model.action_decoder, **get_compilation_args(args))
-    trt_action_decoder.set_expected_dynamic_shape_range(dynamic_shapes, {})
+
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_action_decoder(hidden_states, embodiment_id)
     
@@ -905,6 +877,7 @@ def run_groot_inference(
             trt_action_head = compile_action_head(model.action_head, args, attention_mask=attention_mask, state=state)
             model.action_head = trt_action_head
         elif args.fn_name == "all":
+            
             # Run pytorch inference and get the predicted action
             pyt_predicted_action = policy.get_action(step_data)
 
@@ -1003,6 +976,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_onnx_vit", action="store_true", help="Use ONNX version of the Vision Transformer model (default: False)"
+    )
+    parser.add_argument(
+        "--use_eagle_backbone_joint", action="store_true", help="Use joint compilation of the eagle backbone (default: False)"
     )
     parser.add_argument(
         "--benchmark",
