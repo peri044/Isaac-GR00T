@@ -115,6 +115,30 @@ if __name__ == "__main__":
         help="Path to the TensorRT engine",
         default="gr00t_engine",
     )
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        help="cuda_event or python_timer",
+        default="cuda_event",
+    )
+    parser.add_argument(
+        "--num_iterations",
+        type=int,
+        help="Number of iterations to run for benchmarking",
+        default=10,
+    )
+    parser.add_argument(
+        "--warmup_iterations",
+        type=int,
+        help="Number of warmup iterations to run for benchmarking",
+        default=5,
+    )
+    parser.add_argument(
+        "--use_sdpa",
+        action="store_true",
+        help="Use SDPA attention implementation instead of flash attention",
+        default=False,
+    )
     args = parser.parse_args()
 
     MODEL_PATH = args.model_path
@@ -176,11 +200,25 @@ if __name__ == "__main__":
         policy.model.action_head.get_action = partial(
             action_head_pytorch_forward, policy.model.action_head
         )
+        if args.use_sdpa:
+            policy.model.backbone.eagle_model.vision_model.config._attn_implementation = "sdpa"
+            policy.model.backbone.eagle_model.language_model.config._attn_implementation = "sdpa"
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from utils import benchmark_policy, compare_benchmark_outputs
         predicted_action_torch = policy.get_action(step_data)
+        if args.benchmark:
+            pyt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args)
 
         # Setup TensorRT engines and run inference
         setup_tensorrt_engines(policy, args.trt_engine_path)
         predicted_action_tensorrt = policy.get_action(step_data)
+        if args.benchmark:
+            trt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args)
 
         # Compare predictions
         compare_predictions(predicted_action_tensorrt, predicted_action_torch)
+
+        if args.benchmark:
+            compare_benchmark_outputs(pyt_timings, trt_timings)
