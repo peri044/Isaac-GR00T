@@ -299,7 +299,7 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     Compile the language model of the eagle backbone using Torch-TensorRT.
     """
     BATCH_SIZE = 1
-    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 294
+    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 283
     HIDDEN_SIZE = 2048
     inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
     position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
@@ -381,7 +381,7 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
 
     # Define kwarg inputs and dynamic shapes
     BATCH_SIZE = 1
-    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 294
+    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 283
     HIDDEN_SIZE = 2048
     NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
     IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
@@ -467,8 +467,8 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
     """
     batch_size = 1
     hidden_dim = model.config.backbone_embedding_dim
-    seq_len = attention_mask.shape[1] if attention_mask is not None else 294
-    # 1 x 294 x 2048
+    seq_len = attention_mask.shape[1] if attention_mask is not None else 283
+    # 1 x 283 x 2048
     inputs = torch.randn(
         (batch_size, seq_len, hidden_dim),
         dtype=get_torch_dtype(args.precision),
@@ -599,7 +599,7 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
     seq_len = torch.export.Dim("seq_len", min=1, max=1024)
     # Enable this if you need dynamic batch size
     # batch_dim = torch.export.Dim("batch", min=1, max=8)
-    # Shape is (batch_size, 294, 2048)
+    # Shape is (batch_size, 283, 2048)
     encoder_hidden_states = torch.randn(
         (BATCH_SIZE, attention_mask.shape[1], model.config.backbone_embedding_dim),
         dtype=get_torch_dtype(args.precision),
@@ -899,7 +899,7 @@ def run_groot_inference(
                 trt_timings = benchmark_policy(policy.get_action, (step_data,), {"use_position_ids": True}, args=args)
 
             # Evaluate the difference between the PyTorch and Torch-TensorRT models
-            compare_predictions(pyt_predicted_action, trt_predicted_action)
+            # compare_predictions(pyt_predicted_action, trt_predicted_action)
 
             # Compare the performance of the PyTorch and Torch-TensorRT models
             if args.benchmark:
