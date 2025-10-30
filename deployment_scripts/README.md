@@ -21,6 +21,8 @@ python deployment_scripts/gr00t_inference.py --inference_mode=tensorrt
 
 ### Prerequisites
 
+- Jetson Thor installed with Jetpack 7.0
+or
 - AGX Orin installed with Jetpack 6.2
 
 ### 1. Installation Guide
@@ -34,7 +36,7 @@ cd Isaac-GR00T
 
 ### Install Isaac-GR00T directly
 
-Run below setup script to install the dependencies:
+Run below setup script to install the dependencies for Jetson Orin. Please deploy with container for Jetson Thor:
 
 ```sh
 bash deployment_scripts/setup_env.sh
@@ -46,6 +48,12 @@ bash deployment_scripts/setup_env.sh
 
 To build a container for Isaac-GR00T:
 
+Build container for Jetson Thor:
+```sh
+docker build -t isaac-gr00t-n1.5:l4t-jp7.0 -f thor.Dockerfile .
+```
+
+Build container for Jetson Orin:
 ```sh
 docker build -t isaac-gr00t-n1.5:l4t-jp6.2 -f orin.Dockerfile .
 ```
@@ -54,8 +62,14 @@ docker build -t isaac-gr00t-n1.5:l4t-jp6.2 -f orin.Dockerfile .
 
 To run the container:
 
+Run container for Thor:
 ```sh
-docker run -it --rm --network=host --runtime=nvidia --volume /mnt:/mnt --workdir /mnt/Isaac-GR00T   isaac-gr00t-n1.5:l4t-jp6.2  /bin/bash
+docker run --rm -it --runtime nvidia -v "$PWD":/workspace -w /workspace isaac-gr00t-n1.5:l4t-jp7.0
+```
+
+Run container for Orin:
+```sh
+docker run --rm -it --runtime nvidia -v "$PWD":/workspace -w /workspace isaac-gr00t-n1.5:l4t-jp6.2
 ```
 
 ### 2. Inference
@@ -63,6 +77,7 @@ docker run -it --rm --network=host --runtime=nvidia --volume /mnt:/mnt --workdir
 * The GR00T N1.5 model is hosted on [Huggingface](https://huggingface.co/nvidia/GR00T-N1.5-3B)
 * Example cross embodiment dataset is available at [demo_data/robot_sim.PickNPlace](./demo_data/robot_sim.PickNPlace)
 * This project supports to run the inference with PyTorch or Python TensorRT as instructions below
+* Add Isaac-GR00T to PYTHONPATH: `export PYTHONPATH=/path/to/Isaac-GR00T:$PYTHONPATH`
 
 ### 2.1 Inference with PyTorch
 
@@ -105,4 +120,4 @@ Model latency measured by `trtexec` with batch_size=1.
 | VLM - ViT                                      |11.96                     |FP16     |
 | VLM - LLM                                      |17.25                     |FP16     |  
       
-**Note**：The module latency (e.g., DiT Block) in pipeline is slighly longer than the modoel latency in benchmark table above because the module (e.g., Action_Head - DiT) latency not only includes the model latency in table above but also accounts for the overhead of data transfer from PyTorch to TRT and returning from TRT to to PyTorch.
+**Note**：The module latency (e.g., DiT Block) in pipeline is slighly longer than the model latency in benchmark table above because the module (e.g., Action_Head - DiT) latency not only includes the model latency in table above but also accounts for the overhead of data transfer from PyTorch to TRT and returning from TRT to to PyTorch.

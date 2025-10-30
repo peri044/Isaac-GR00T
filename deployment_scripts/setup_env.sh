@@ -29,11 +29,54 @@ sudo apt-get install -y --no-install-recommends \
       libtbb12 \
       libtbb2 \
       libatlas-base-dev \
-      libopenblas-dev 
+      libopenblas-dev \
+      build-essential \
+      python3-setuptools \
+      make \
+      cmake \
+      nasm
 
-#Set to get precompiled jetson wheels
-export PIP_INDEX_URL=https://pypi.jetson-ai-lab.dev/jp6/cu126
-export PIP_TRUSTED_HOST=pypi.jetson-ai-lab.dev
+# Install cuDSS (CUDA Deep Neural Network library)
+echo "Installing cuDSS..."
+cd /tmp
+wget https://developer.download.nvidia.com/compute/cudss/0.6.0/local_installers/cudss-local-tegra-repo-ubuntu2204-0.6.0_0.6.0-1_arm64.deb
+sudo dpkg -i cudss-local-tegra-repo-ubuntu2204-0.6.0_0.6.0-1_arm64.deb
+sudo cp /var/cudss-local-tegra-repo-ubuntu2204-0.6.0/cudss-*-keyring.gpg /usr/share/keyrings/
+sudo apt-get update
+sudo apt-get -y install cudss
+
+# Clean up downloaded package
+rm -f cudss-local-tegra-repo-ubuntu2204-0.6.0_0.6.0-1_arm64.deb
+
+# Set to get precompiled jetson wheels
+export PIP_INDEX_URL=https://pypi.jetson-ai-lab.io/jp6/cu126
+export PIP_TRUSTED_HOST=pypi.jetson-ai-lab.io
 
 pip3 install --upgrade pip setuptools
 pip3 install -e .[orin]
+
+# Build and install decord
+echo "Building and installing decord..."
+# Change to /tmp for builds
+cd /tmp
+# Clone the FFmpeg repository
+git clone https://git.ffmpeg.org/ffmpeg.git
+cd ffmpeg
+git checkout n4.4.2
+./configure \
+  --enable-shared \
+  --enable-pic \
+  --prefix=/usr
+make -j$(nproc)
+sudo make install
+cd /tmp
+# Build and install decord
+git clone --recursive https://github.com/dmlc/decord
+cd decord
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make
+cd ../python
+python3 setup.py install --user
+cd /tmp
+rm -rf /tmp/ffmpeg /tmp/decord
