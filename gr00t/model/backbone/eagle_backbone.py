@@ -24,6 +24,8 @@ import gr00t
 DEFAULT_EAGLE_PATH = os.path.join(
     os.path.dirname(gr00t.__file__), "model", "backbone", "eagle2_hg_model"
 )
+# Default attention implementation, can be overridden via environment variable or parameter
+DEFAULT_ATTN_IMPLEMENTATION = os.environ.get("ATTN_IMPLEMENTATION", "flash_attention_2")
 
 
 class EagleBackbone(nn.Module):
@@ -46,10 +48,15 @@ class EagleBackbone(nn.Module):
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
-
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-        config._attn_implementation = "sdpa"
+        
+        # Set attention implementation - use parameter if provided, otherwise use default flash_attention_2
+        config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+        
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        self.eagle_model.vision_model.config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+        self.eagle_model.language_model.config._attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+        
         self.use_position_ids = False
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)

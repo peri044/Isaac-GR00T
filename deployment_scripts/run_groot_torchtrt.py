@@ -2,6 +2,12 @@ import argparse
 import os
 from typing import Dict
 import numpy as np
+
+# Global attention implementation setting
+# Read from environment variable first, otherwise default to "eager". 
+# We use eager instead of flash_attention_2 since flash_attention_2 export is not supported by Torch-TensorRT.
+ATTN_IMPLEMENTATION = os.environ.setdefault("ATTN_IMPLEMENTATION", "eager")
+
 from gr00t.model.policy import Gr00tPolicy, unsqueeze_dict_values
 from gr00t.data.dataset import LeRobotSingleDataset
 import torch 
@@ -20,12 +26,8 @@ from transformers.models.siglip.modeling_siglip import (
 )
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
-# To run trtexec on TRT engines,
-# trtexec --loadEngine=gr00t_engine/state_encoder.engine --shapes='state:1x1x64,embodiment_id:1'
-# trtexec --loadEngine=gr00t_engine/action_encoder.engine --shapes='actions:1x16x32,timesteps_tensor:1,embodiment_id:1 
-
 # Use this command to run this script:
-# python run_groot.py --precision FP16 --use_fp32_acc --use_explicit_typing --fn_name all  --benchmark cuda_event --use_eagle_backbone_joint
+# python run_groot.py --precision FP16 --use_fp32_acc --use_explicit_typing --fn_name all  --benchmark cuda_event 
 
 def get_groot_policy(args: argparse.Namespace):
     """
@@ -53,9 +55,9 @@ def get_groot_policy(args: argparse.Namespace):
         )
         # Cast all the model components of the policy to the precision specified in the args.
         policy.model = policy.model.eval().to(get_torch_dtype(args.precision))
-        # We don't support flash_attn in the current version of Torch-TensorRT. So we replace it with SDPA in the model.
-        policy.model.backbone.eagle_model.vision_model.config._attn_implementation = "sdpa"
-        policy.model.backbone.eagle_model.language_model.config._attn_implementation = "sdpa"
+        # Ensure attention implementation is set correctly (should already be set in EagleBackbone.__init__)
+        policy.model.backbone.eagle_model.vision_model.config._attn_implementation = ATTN_IMPLEMENTATION
+        policy.model.backbone.eagle_model.language_model.config._attn_implementation = ATTN_IMPLEMENTATION
     
     return policy
 
@@ -139,7 +141,7 @@ def get_onnx_vit_model(vision_model, args: argparse.Namespace):
 
     class SiglipVisionTransformerOpt(SiglipVisionTransformer):
         def __init__(self, config: SiglipVisionConfig):
-            config._attn_implementation = "sdpa"
+            config._attn_implementation = ATTN_IMPLEMENTATION
             super().__init__(config)
             self.embeddings = SiglipVisionEmbeddingsOpt(config)
 
@@ -397,8 +399,8 @@ def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Names
     if args.use_eagle_backbone_joint:
         return compile_eagle_backbone_joint(eagle_backbone, args, attention_mask=attention_mask)
 
-    eagle_backbone.vision_model.config._attn_implementation = "sdpa"
-    eagle_backbone.language_model.config._attn_implementation = "sdpa"
+    eagle_backbone.vision_model.config._attn_implementation = ATTN_IMPLEMENTATION
+    eagle_backbone.language_model.config._attn_implementation = ATTN_IMPLEMENTATION
 
     # Compile the vision model
     trt_vision_model = compile_vision_model(eagle_backbone.vision_model, args)
@@ -421,8 +423,8 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
     Returns:
         The compiled eagle backbone
     """
-    eagle_backbone.vision_model.config._attn_implementation = "sdpa"
-    eagle_backbone.language_model.config._attn_implementation = "sdpa"
+    eagle_backbone.vision_model.config._attn_implementation = ATTN_IMPLEMENTATION
+    eagle_backbone.language_model.config._attn_implementation = ATTN_IMPLEMENTATION
     # This setting is specific to Eagle2.5VL model which uses SiglipVisionModel as the vision model.
     # The use_head adds a multi-attention head on the encoder outputs which isn't used in Eagle2.5VL model
     # and hence we set the use_head flag to False to avoid the latency introduced by the head.
@@ -959,7 +961,7 @@ def run_groot_inference(
             print("No component is compiled with Torch-TensorRT. Running PyTorch inference.")
 
 
-        print("=========Groot N1.5 3B inference complete=========")
+        print("=========Groot N1.5 3B inference completed=========")
 
     
 
@@ -970,7 +972,7 @@ if __name__ == "__main__":
         "--dataset_path",
         type=str,
         help="Path to the dataset",
-        default=os.path.join(os.getcwd(), "demo_data/robot_sim.PickNPlace"),
+        default=os.path.join(os.getcwd(), "../demo_data/robot_sim.PickNPlace"),
     )
     parser.add_argument(
         "--model_path",
@@ -1057,8 +1059,20 @@ if __name__ == "__main__":
         help="Device to run the model on",
         default="cuda:0",
     )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        help="Attention implementation to use (flash_attention_2, sdpa, eager, etc.)",
+        default="eager",
+    )
 
     args = parser.parse_args()
+    
+    # Update global ATTN_IMPLEMENTATION if provided via command line
+    if args.attn_implementation is not None:
+        ATTN_IMPLEMENTATION = args.attn_implementation
+        os.environ["ATTN_IMPLEMENTATION"] = ATTN_IMPLEMENTATION
+        print(f"Using attention implementation: {ATTN_IMPLEMENTATION}")
 
     print(f"Dataset path: {args.dataset_path}")
     print(f"Model path: {args.model_path}")

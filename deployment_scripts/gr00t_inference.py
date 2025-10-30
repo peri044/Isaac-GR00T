@@ -17,6 +17,10 @@ import argparse
 import os
 from functools import partial
 
+# Global attention implementation setting
+# Read from environment variable first, otherwise default to "eager". 
+ATTN_IMPLEMENTATION = os.environ.setdefault("ATTN_IMPLEMENTATION", "eager")
+
 import torch
 from action_head_utils import action_head_pytorch_forward
 from trt_model_forward import setup_tensorrt_engines
@@ -25,7 +29,7 @@ import gr00t
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from gr00t.model.policy import Gr00tPolicy
-
+from utils import benchmark_policy, compare_benchmark_outputs
 
 def compare_predictions(pred_tensorrt, pred_torch):
     """
@@ -133,12 +137,7 @@ if __name__ == "__main__":
         help="Number of warmup iterations to run for benchmarking",
         default=5,
     )
-    parser.add_argument(
-        "--use_sdpa",
-        action="store_true",
-        help="Use SDPA attention implementation instead of flash attention",
-        default=False,
-    )
+
     args = parser.parse_args()
 
     MODEL_PATH = args.model_path
@@ -200,14 +199,9 @@ if __name__ == "__main__":
         policy.model.action_head.get_action = partial(
             action_head_pytorch_forward, policy.model.action_head
         )
-        if args.use_sdpa:
-            policy.model.backbone.eagle_model.vision_model.config._attn_implementation = "sdpa"
-            policy.model.backbone.eagle_model.language_model.config._attn_implementation = "sdpa"
-        import sys
-        import os
-        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from utils import benchmark_policy, compare_benchmark_outputs
+
         predicted_action_torch = policy.get_action(step_data)
+
         if args.benchmark:
             pyt_timings = benchmark_policy(policy.get_action, (step_data,), {}, args)
 

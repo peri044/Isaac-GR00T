@@ -47,9 +47,9 @@ import importlib.util
 HAS_FLASH_ATTN = importlib.util.find_spec("flash_attn") is not None
 
 if HAS_FLASH_ATTN:
-    try:
+    try: # v1
         from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-    except ImportError:
+    except ImportError: # v2
         from flash_attn.flash_attn_interface import (
             flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
         )
