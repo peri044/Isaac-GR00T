@@ -416,6 +416,9 @@ def run_groot_inference(
     )
 
     step_data = dataset[0]
+
+    policy.model.backbone.eagle_model.vision_model.config._attn_implementation = "sdpa"
+    policy.model.backbone.eagle_model.language_model.config._attn_implementation = "sdpa"
     # get the action
     predicted_action = policy.get_action(step_data)
 

@@ -298,9 +298,14 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     """
     Compile the language model of the eagle backbone using Torch-TensorRT.
     """
+    if args.use_onnx_llm:
+        trt_language_model = compile_language_model_with_attention_mask(language_model, args, attention_mask=attention_mask)
+        return trt_language_model
+
     BATCH_SIZE = 1
-    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 283
+    SEQ_LEN = 283 #attention_mask.shape[1] if attention_mask is not None else 283
     HIDDEN_SIZE = 2048
+
     inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
     position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
     kwarg_inputs = {
@@ -318,14 +323,59 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     }
 
     settings = get_compilation_args(args)
-    
     trt_language_model = torch_tensorrt.MutableTorchTensorRTModule(language_model, **settings)
     trt_language_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_language_model(**kwarg_inputs)
     
     eval_outputs(language_model, trt_language_model, kwarg_inputs, args)
- 
+
+    if args.benchmark and args.fn_name == "language_model":
+        pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
+        trt_timings = benchmark_policy(trt_language_model, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
+
+    return trt_language_model
+
+def compile_language_model_with_attention_mask(language_model: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
+    """
+    Compile the language model of the eagle backbone using Torch-TensorRT.
+    """
+    BATCH_SIZE = 1
+    SEQ_LEN = 283 #attention_mask.shape[1] if attention_mask is not None else 283
+    HIDDEN_SIZE = 2048
+
+    inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
+    attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
+    cache_position = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device)
+    position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
+    kwarg_inputs = {
+        "inputs_embeds": inputs_embeds,
+        # "cache_position": cache_position,
+        "position_ids": position_ids,
+        # "attention_mask": attention_mask,
+        "output_hidden_states": True,
+    }
+
+    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=300)
+    kwarg_dynamic_shapes = {
+        "inputs_embeds": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
+        # "cache_position": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
+        "position_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
+        # "attention_mask": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
+        "output_hidden_states": None,
+    }
+
+    settings = get_compilation_args(args)
+
+    trt_language_model = torch_tensorrt.MutableTorchTensorRTModule(language_model, **settings)
+    trt_language_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
+    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
+        trt_language_model(**kwarg_inputs)
+    
+    eval_outputs(language_model, trt_language_model, kwarg_inputs, args)
+
     if args.benchmark and args.fn_name == "language_model":
         pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
         trt_timings = benchmark_policy(trt_language_model, (), kwarg_inputs, args=args)
@@ -381,7 +431,7 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
 
     # Define kwarg inputs and dynamic shapes
     BATCH_SIZE = 1
-    SEQ_LEN = attention_mask.shape[1] if attention_mask is not None else 283
+    SEQ_LEN = 283 #attention_mask.shape[1] if attention_mask is not None else 283
     HIDDEN_SIZE = 2048
     NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
     IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
@@ -467,7 +517,7 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
     """
     batch_size = 1
     hidden_dim = model.config.backbone_embedding_dim
-    seq_len = attention_mask.shape[1] if attention_mask is not None else 283
+    seq_len = 283 #attention_mask.shape[1] if attention_mask is not None else 283
     # 1 x 283 x 2048
     inputs = torch.randn(
         (batch_size, seq_len, hidden_dim),
@@ -979,6 +1029,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_eagle_backbone_joint", action="store_true", help="Use joint compilation of the eagle backbone (default: False)"
+    )
+    parser.add_argument(
+        "--use_onnx_llm", action="store_true", help="Use ONNX version of the Language Model (default: False)"
     )
     parser.add_argument(
         "--benchmark",
