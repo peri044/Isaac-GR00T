@@ -951,7 +951,7 @@ def run_groot_inference(
                 trt_timings = benchmark_policy(policy.get_action, (step_data,), {"use_position_ids": True}, args=args)
 
             # Evaluate the difference between the PyTorch and Torch-TensorRT models
-            # compare_predictions(pyt_predicted_action, trt_predicted_action)
+            compare_predictions(pyt_predicted_action, trt_predicted_action)
 
             # Compare the performance of the PyTorch and Torch-TensorRT models
             if args.benchmark:
@@ -972,7 +972,7 @@ if __name__ == "__main__":
         "--dataset_path",
         type=str,
         help="Path to the dataset",
-        default=os.path.join(os.getcwd(), "../demo_data/robot_sim.PickNPlace"),
+        default=os.path.join(os.getcwd(), "./demo_data/robot_sim.PickNPlace"),
     )
     parser.add_argument(
         "--model_path",
