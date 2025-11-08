@@ -895,7 +895,22 @@ def run_groot_inference(
         model=policy.model.eval().to(args.device).to(get_torch_dtype(args.precision))
 
         # model.action_head.state_encoder = CategorySpecificMLP(32, 64, 1024, 1536).eval().to(args.device).to(get_torch_dtype(args.precision))
-        
+        if args.vit_dtype:
+            from quant_utils import quantize_vit
+            vision_model = quantize_vit(
+                model.backbone.eagle_model.vision_model,
+                precision="fp8",
+                calib_size=10,
+                dataset_path=args.dataset_path,
+                modality_configs=None,
+                embodiment_tag="gr1",
+                policy=policy,
+                denoising_steps=args.denoising_steps,
+                data_config="fourier_gr1_arms_only",
+                model_path=args.model_path,
+                video_backend="decord",
+            )
+        breakpoint()
         if args.use_onnx_vit:
             model.backbone.eagle_model.vision_model = get_onnx_vit_model(model.backbone.eagle_model.vision_model, args)
         # Get the input info
@@ -986,6 +1001,12 @@ if __name__ == "__main__":
         type=str,
         help="FP16 or FP32",
         default="FP16",
+    )
+    parser.add_argument(
+        "--vit_dtype",
+        type=str,
+        help="Quantization precision for the ViT model (FP8)",
+        default=None,
     )
     parser.add_argument(
         "--denoising_steps",
