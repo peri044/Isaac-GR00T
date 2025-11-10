@@ -115,12 +115,12 @@ Install `torch-tensorrt==2.9.0` along with its dependencies `torch==2.9.0` and `
 
 ```bash
 pip uninstall -y flash_attn torch
-pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu130
+pip install torch==2.9.0 torchvision==0.24.0 torch-tensorrt==2.9.0 --index-url https://download.pytorch.org/whl/cu130
 ```
 
 3) Run the model with Torch-TensorRT
 
-```py
+```bash
 python deployment_scripts/run_groot_torchtrt.py --precision FP16 --use_fp32_acc --use_explicit_typing --fn_name all  --benchmark cuda_event
 ```
 This will compile and optimize VIT, LLM, VLLN components, state_encoder, action_encoder, DIT and action decoder components respectively.

@@ -25,6 +25,7 @@ from transformers.models.siglip.modeling_siglip import (
     SiglipVisionTransformer,
 )
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+from modelopt.torch.quantization.utils import export_torch_mode
 
 # Use this command to run this script:
 # python run_groot.py --precision FP16 --use_fp32_acc --use_explicit_typing --fn_name all  --benchmark cuda_event 
@@ -250,7 +251,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
     """
     Compile the vision model of the eagle backbone using Torch-TensorRT.
     """
-
+    
     if args.use_onnx_vit:
         trt_vision_model = compile_onnx_vit_model(vision_model, args)
         return trt_vision_model
@@ -273,6 +274,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
         "output_hidden_states": False,
         # "return_dict": True,
     }
+    
     # Enable this if you need dynamic batch size
     # BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
     # kwarg_dynamic_shapes = {
@@ -284,15 +286,21 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
     settings = get_compilation_args(args)
     settings.update({"allow_complex_guards_as_runtime_asserts": True})
     trt_vision_model = torch_tensorrt.MutableTorchTensorRTModule(vision_model, **settings)
-    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_vision_model(**kwarg_inputs)
-    
-    eval_outputs(vision_model, trt_vision_model, kwarg_inputs, args)
 
-    if args.benchmark and args.fn_name == "vision_model":
-        pyt_timings = benchmark_policy(vision_model, (), kwarg_inputs, args=args)
-        trt_timings = benchmark_policy(trt_vision_model, (), kwarg_inputs, args=args)
-        compare_benchmark_outputs(pyt_timings, trt_timings)
+    with (export_torch_mode() if args.vit_dtype=="FP8" else nullcontext()):
+        with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
+            trt_vision_model(**kwarg_inputs)
+
+        eval_outputs(vision_model, trt_vision_model, kwarg_inputs, args)
+
+        if args.benchmark and args.fn_name == "vision_model":
+            trt_timings = benchmark_policy(trt_vision_model, (), kwarg_inputs, args=args)
+            if not args.vit_dtype == "FP8":
+                pyt_timings = benchmark_policy(vision_model, (), kwarg_inputs, args=args)
+            else:
+                pyt_timings = trt_timings
+            
+            compare_benchmark_outputs(pyt_timings, trt_timings)
 
     return trt_vision_model
 
@@ -894,15 +902,17 @@ def run_groot_inference(
         # Set the model to evaluation mode and move it to the specified device with the correct precision
         model=policy.model.eval().to(args.device).to(get_torch_dtype(args.precision))
 
-        # model.action_head.state_encoder = CategorySpecificMLP(32, 64, 1024, 1536).eval().to(args.device).to(get_torch_dtype(args.precision))
+        if args.use_onnx_vit:
+            model.backbone.eagle_model.vision_model = get_onnx_vit_model(model.backbone.eagle_model.vision_model, args)
+
         if args.vit_dtype:
             from quant_utils import quantize_vit
-            vision_model = quantize_vit(
+            model.backbone.eagle_model.vision_model = quantize_vit(
                 model.backbone.eagle_model.vision_model,
                 precision="fp8",
                 calib_size=10,
                 dataset_path=args.dataset_path,
-                modality_configs=None,
+                modality_configs=policy.modality_config,
                 embodiment_tag="gr1",
                 policy=policy,
                 denoising_steps=args.denoising_steps,
@@ -910,9 +920,7 @@ def run_groot_inference(
                 model_path=args.model_path,
                 video_backend="decord",
             )
-        breakpoint()
-        if args.use_onnx_vit:
-            model.backbone.eagle_model.vision_model = get_onnx_vit_model(model.backbone.eagle_model.vision_model, args)
+
         # Get the input info
         attention_mask, state = get_input_info(policy, step_data)
         

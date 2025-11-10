@@ -111,6 +111,7 @@ def _quantize_model(model, calib_dataloader, quant_cfg):
             if idx % 10 == 0:
                 print(f"Calibrating batch {idx}...")
             data = {k: v.to(next(model.parameters()).device) for k, v in data.items()}
+            # breakpoint()
             model(**data)
 
     print("Starting quantization...")
