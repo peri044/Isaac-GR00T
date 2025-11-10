@@ -19,6 +19,10 @@ import os
 import time
 from typing import Dict, Optional
 
+# Global attention implementation setting
+# Read from environment variable first, otherwise default to "eager". 
+ATTN_IMPLEMENTATION = os.environ.setdefault("ATTN_IMPLEMENTATION", "eager")
+
 import modelopt.torch.quantization as mtq
 import numpy as np
 import torch
@@ -996,7 +1000,7 @@ def export_eagle2_vit(
 
     class SiglipVisionTransformerOpt(SiglipVisionTransformer):
         def __init__(self, config: SiglipVisionConfig):
-            config._attn_implementation = "eager"
+            config._attn_implementation = ATTN_IMPLEMENTATION
             super().__init__(config)
             self.embeddings = SiglipVisionEmbeddingsOpt(config)
 
@@ -1120,7 +1124,7 @@ def export_eagle2_llm(
 
             # Modify LlamamModel architecture for ONNX export
             config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-            config._attn_implementation = "eager"  # not use flash attention
+            config._attn_implementation = ATTN_IMPLEMENTATION
 
             assert config.text_config.architectures[0] == "Qwen3ForCausalLM"
             self.eagle_model.language_model = Qwen3ForCausalLM(config.text_config)
