@@ -98,7 +98,8 @@ docker run --rm -it --runtime nvidia -v "$PWD":/workspace -w /workspace isaac-gr
 Install `torch-tensorrt==2.9.0` along with its dependencies `torch==2.9.0` and `torchvision==0.24.0`. Additionally, uninstall `flash_attn` to avoid potential conflicts, as it is not required for inference.
 
 ```bash
-pip uninstall -y flash_attn torch
+pip uninstall -y flash_attn torch nvidia-modelopt transformer_engine
+pip install -U "nvidia-modelopt[all]"
 pip install torch==2.9.0 torchvision==0.24.0 torch-tensorrt==2.9.0 --index-url https://download.pytorch.org/whl/cu130
 ```
 

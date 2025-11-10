@@ -25,6 +25,7 @@ class ViTCalibrationDataset(Dataset):
         policy: Gr00tPolicy,
         calib_size: int = 100,
         video_backend: str = "decord",
+        use_position_ids: bool = False,
     ):
         """
         Initialize the ViT calibration dataset.
@@ -39,7 +40,7 @@ class ViTCalibrationDataset(Dataset):
         """
         self.calib_size = calib_size
         self.policy = policy
-
+        self.use_position_ids = use_position_ids
         # Initialize the LeRobot dataset
         self.lerobot_dataset = LeRobotSingleDataset(
             dataset_path=dataset_path,
@@ -88,10 +89,15 @@ class ViTCalibrationDataset(Dataset):
                 position_ids = torch.arange(
                     num_patches, dtype=torch.long, device=pixel_values.device
                 ).expand((batch_size, -1))
-                return {
-                    "pixel_values": pixel_values,
-                    "position_ids": position_ids,
-                }
+                if self.use_position_ids:
+                    return {
+                        "pixel_values": pixel_values,
+                        "position_ids": position_ids,
+                    }
+                else:
+                    return {
+                        "pixel_values": pixel_values,
+                    }
             else:
                 raise RuntimeError(
                     "eagle data not found in transformed_data. This indicates an issue with apply_transforms()."
@@ -136,6 +142,7 @@ def quantize_vit(
     denoising_steps=4,
     data_config="fourier_gr1_arms_only",
     model_path="nvidia/GR00T-N1.5-3B",
+    use_position_ids=False,
 ):
     """
     Quantize the ViT model using FP8 quantization.
@@ -195,6 +202,7 @@ def quantize_vit(
         policy=policy_copy2,
         calib_size=calib_size,
         video_backend=video_backend,
+        use_position_ids=use_position_ids,
     )
 
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)

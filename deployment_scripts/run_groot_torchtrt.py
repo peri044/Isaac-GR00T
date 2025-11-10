@@ -25,7 +25,10 @@ from transformers.models.siglip.modeling_siglip import (
     SiglipVisionTransformer,
 )
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
-from modelopt.torch.quantization.utils import export_torch_mode
+try:
+    from modelopt.torch.quantization.utils import export_torch_mode
+except ImportError:
+    export_torch_mode = nullcontext
 
 # Use this command to run this script:
 # python run_groot.py --precision FP16 --use_fp32_acc --use_explicit_typing --fn_name all  --benchmark cuda_event 
@@ -313,7 +316,7 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
         return trt_language_model
 
     BATCH_SIZE = 1
-    SEQ_LEN = 283 #attention_mask.shape[1] if attention_mask is not None else 283
+    SEQ_LEN = 296 #attention_mask.shape[1] if attention_mask is not None else 296
     HIDDEN_SIZE = 2048
 
     inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
@@ -352,7 +355,7 @@ def compile_language_model_with_attention_mask(language_model: torch.nn.Module, 
     Compile the language model of the eagle backbone using Torch-TensorRT.
     """
     BATCH_SIZE = 1
-    SEQ_LEN = 283 #attention_mask.shape[1] if attention_mask is not None else 283
+    SEQ_LEN = 296 #attention_mask.shape[1] if attention_mask is not None else 296
     HIDDEN_SIZE = 2048
 
     inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
@@ -441,7 +444,7 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
 
     # Define kwarg inputs and dynamic shapes
     BATCH_SIZE = 1
-    SEQ_LEN = 283 #attention_mask.shape[1] if attention_mask is not None else 283
+    SEQ_LEN = 296 #attention_mask.shape[1] if attention_mask is not None else 296
     HIDDEN_SIZE = 2048
     NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
     IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
@@ -527,8 +530,8 @@ def compile_vl_components(model: torch.nn.Module, args: argparse.Namespace, atte
     """
     batch_size = 1
     hidden_dim = model.config.backbone_embedding_dim
-    seq_len = 283 #attention_mask.shape[1] if attention_mask is not None else 283
-    # 1 x 283 x 2048
+    seq_len = 296 #attention_mask.shape[1] if attention_mask is not None else 296
+    # 1 x 296 x 2048
     inputs = torch.randn(
         (batch_size, seq_len, hidden_dim),
         dtype=get_torch_dtype(args.precision),
@@ -659,7 +662,7 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
     seq_len = torch.export.Dim("seq_len", min=1, max=1024)
     # Enable this if you need dynamic batch size
     # batch_dim = torch.export.Dim("batch", min=1, max=8)
-    # Shape is (batch_size, 283, 2048)
+    # Shape is (batch_size, 296, 2048)
     encoder_hidden_states = torch.randn(
         (BATCH_SIZE, attention_mask.shape[1], model.config.backbone_embedding_dim),
         dtype=get_torch_dtype(args.precision),
@@ -679,15 +682,19 @@ def compile_dit_model(model: torch.nn.Module, args: argparse.Namespace, attentio
     }
     trt_dit_model = torch_tensorrt.MutableTorchTensorRTModule(model.model, **get_compilation_args(args))
     trt_dit_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
-    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_dit_model(**kwarg_inputs)
+    with (export_torch_mode() if args.dit_dtype == "fp8" else nullcontext()):
+        with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
+            trt_dit_model(**kwarg_inputs)
 
-    eval_outputs(model.model, trt_dit_model, kwarg_inputs, args)
+        eval_outputs(model.model, trt_dit_model, kwarg_inputs, args)
 
-    if args.benchmark and args.fn_name == "dit_model":
-        pyt_timings = benchmark_policy(model.model, (), kwarg_inputs, args=args)
-        trt_timings = benchmark_policy(trt_dit_model, (), kwarg_inputs, args=args)
-        compare_benchmark_outputs(pyt_timings, trt_timings)
+        if args.benchmark and args.fn_name == "dit_model":
+            trt_timings = benchmark_policy(trt_dit_model, (), kwarg_inputs, args=args)
+            if not args.dit_dtype == "fp8":
+                pyt_timings = benchmark_policy(model.model, (), kwarg_inputs, args=args)
+            else:
+                pyt_timings = trt_timings
+            compare_benchmark_outputs(pyt_timings, trt_timings)
 
     return trt_dit_model
 
@@ -902,11 +909,14 @@ def run_groot_inference(
         # Set the model to evaluation mode and move it to the specified device with the correct precision
         model=policy.model.eval().to(args.device).to(get_torch_dtype(args.precision))
 
+        # Get the input info
+        attention_mask, state = get_input_info(policy, step_data)
+
         if args.use_onnx_vit:
             model.backbone.eagle_model.vision_model = get_onnx_vit_model(model.backbone.eagle_model.vision_model, args)
 
-        if args.vit_dtype:
-            from quant_utils import quantize_vit
+        if args.vit_dtype == "fp8":
+            from export_onnx import quantize_vit
             model.backbone.eagle_model.vision_model = quantize_vit(
                 model.backbone.eagle_model.vision_model,
                 precision="fp8",
@@ -919,10 +929,31 @@ def run_groot_inference(
                 data_config="fourier_gr1_arms_only",
                 model_path=args.model_path,
                 video_backend="decord",
+                use_position_ids=args.use_onnx_vit,
             )
 
-        # Get the input info
-        attention_mask, state = get_input_info(policy, step_data)
+        # Quantize DiT if requested
+        if args.dit_dtype == "fp8":
+            from export_onnx import quantize_dit
+            # Use a default dataset path if None
+            dataset_path_for_calib = (
+                args.dataset_path if args.dataset_path is not None else "dummy_path"
+            )
+            model.action_head.model = quantize_dit(
+                model.action_head.model,
+                precision="fp8",
+                calib_size=10,
+                dataset_path=dataset_path_for_calib,
+                modality_configs=policy.modality_config,
+                embodiment_tag=args.embodiment_tag,
+                policy=policy,
+                attention_mask=attention_mask,
+                input_state=state,
+                denoising_steps=args.denoising_steps,
+                data_config="fourier_gr1_arms_only",
+                model_path=args.model_path,
+                video_backend="decord",
+            )
         
         if args.fn_name == "eagle_backbone":
             trt_eagle_backbone = compile_eagle_backbone(model.backbone.eagle_model, args, attention_mask=attention_mask)
@@ -1014,6 +1045,12 @@ if __name__ == "__main__":
         "--vit_dtype",
         type=str,
         help="Quantization precision for the ViT model (FP8)",
+        default=None,
+    )
+    parser.add_argument(
+        "--dit_dtype",
+        type=str,
+        help="Quantization precision for the DiT model (FP8)",
         default=None,
     )
     parser.add_argument(
