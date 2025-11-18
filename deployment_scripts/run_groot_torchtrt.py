@@ -290,7 +290,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
     settings.update({"allow_complex_guards_as_runtime_asserts": True})
     trt_vision_model = torch_tensorrt.MutableTorchTensorRTModule(vision_model, **settings)
 
-    with (export_torch_mode() if args.vit_dtype=="FP8" else nullcontext()):
+    with (export_torch_mode() if args.vit_dtype=="fp8" else nullcontext()):
         with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
             trt_vision_model(**kwarg_inputs)
 
@@ -298,7 +298,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
 
         if args.benchmark and args.fn_name == "vision_model":
             trt_timings = benchmark_policy(trt_vision_model, (), kwarg_inputs, args=args)
-            if not args.vit_dtype == "FP8":
+            if not args.vit_dtype == "fp8":
                 pyt_timings = benchmark_policy(vision_model, (), kwarg_inputs, args=args)
             else:
                 pyt_timings = trt_timings
@@ -338,14 +338,19 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     settings = get_compilation_args(args)
     trt_language_model = torch_tensorrt.MutableTorchTensorRTModule(language_model, **settings)
     trt_language_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
-    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_language_model(**kwarg_inputs)
+    with (export_torch_mode() if args.llm_dtype=="fp8" else nullcontext()):
+        with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
+            trt_language_model(**kwarg_inputs)
     
     eval_outputs(language_model, trt_language_model, kwarg_inputs, args)
 
     if args.benchmark and args.fn_name == "language_model":
-        pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
         trt_timings = benchmark_policy(trt_language_model, (), kwarg_inputs, args=args)
+        if not args.llm_dtype == "fp8":
+            pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
+        else:
+            pyt_timings = trt_timings
+        
         compare_benchmark_outputs(pyt_timings, trt_timings)
 
     return trt_language_model
@@ -955,6 +960,25 @@ def run_groot_inference(
                 video_backend="decord",
             )
         
+
+        if args.llm_dtype in ["nvfp4", "fp8"]:
+            from export_onnx import quantize_llm
+
+            model.backbone.eagle_model.language_model = quantize_llm(
+                model.backbone.eagle_model.language_model,
+                precision=args.llm_dtype,
+                calib_size=10,
+                dataset_path=args.dataset_path,
+                modality_configs=policy.modality_config,
+                embodiment_tag=args.embodiment_tag,
+                policy=policy,
+                denoising_steps=args.denoising_steps,
+                data_config="fourier_gr1_arms_only",
+                model_path=args.model_path,
+                video_backend="decord",
+                full_layer_quant=False,
+            )
+
         if args.fn_name == "eagle_backbone":
             trt_eagle_backbone = compile_eagle_backbone(model.backbone.eagle_model, args, attention_mask=attention_mask)
             model.backbone.eagle_model = trt_eagle_backbone
@@ -1051,6 +1075,12 @@ if __name__ == "__main__":
         "--dit_dtype",
         type=str,
         help="Quantization precision for the DiT model (FP8)",
+        default=None,
+    )
+    parser.add_argument(
+        "--llm_dtype",
+        type=str,
+        help="Quantization precision for the LLM model (nvfp4, fp8)",
         default=None,
     )
     parser.add_argument(
