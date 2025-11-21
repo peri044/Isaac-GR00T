@@ -17,7 +17,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from functools import partial
 from typing import Any, Optional
-from utils import benchmark_policy, compare_benchmark_outputs
+from deployment_scripts.utils import benchmark_policy, compare_benchmark_outputs
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.siglip.modeling_siglip import (
@@ -70,7 +70,7 @@ def get_dataset(args: argparse.Namespace):
     Get the dataset.
     """
     with torch.inference_mode(), torch.no_grad():
-        data_config = DATA_CONFIG_MAP["fourier_gr1_arms_only"]
+        data_config = DATA_CONFIG_MAP[args.data_config]
         modality_config = data_config.modality_config()
         # load the dataset
         dataset = LeRobotSingleDataset(
@@ -288,6 +288,7 @@ def compile_vision_model(vision_model: torch.nn.Module, args: argparse.Namespace
 
     settings = get_compilation_args(args)
     settings.update({"allow_complex_guards_as_runtime_asserts": True})
+
     trt_vision_model = torch_tensorrt.MutableTorchTensorRTModule(vision_model, **settings)
 
     with (export_torch_mode() if args.vit_dtype=="fp8" else nullcontext()):
@@ -328,7 +329,7 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     }
 
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=300)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=350)
     kwarg_dynamic_shapes = {
         "inputs_embeds": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
         "position_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
@@ -376,7 +377,7 @@ def compile_language_model_with_attention_mask(language_model: torch.nn.Module, 
     }
 
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=300)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=350)
     kwarg_dynamic_shapes = {
         "inputs_embeds": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
         # "cache_position": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
@@ -473,7 +474,7 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
     }
 
     BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=300)
+    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=350)
     kwarg_dynamic_shapes = {
         "input_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM
         "position_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM
@@ -1095,6 +1096,13 @@ if __name__ == "__main__":
         help="Name of the function to run",
         default="all",
     )
+    parser.add_argument(
+        "--data_config",
+        type=str,
+        help="Data config",
+        default="fourier_gr1_arms_only",
+    )
+    
     parser.add_argument(
         "--embodiment_tag",
         type=str,
