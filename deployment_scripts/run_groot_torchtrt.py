@@ -312,9 +312,6 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
     """
     Compile the language model of the eagle backbone using Torch-TensorRT.
     """
-    if args.use_onnx_llm:
-        trt_language_model = compile_language_model_with_attention_mask(language_model, args, attention_mask=attention_mask)
-        return trt_language_model
 
     BATCH_SIZE = 1
     SEQ_LEN = 296 #attention_mask.shape[1] if attention_mask is not None else 296
@@ -356,51 +353,6 @@ def compile_language_model(language_model: torch.nn.Module, args: argparse.Names
 
     return trt_language_model
 
-def compile_language_model_with_attention_mask(language_model: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
-    """
-    Compile the language model of the eagle backbone using Torch-TensorRT.
-    """
-    BATCH_SIZE = 1
-    SEQ_LEN = 296 #attention_mask.shape[1] if attention_mask is not None else 296
-    HIDDEN_SIZE = 2048
-
-    inputs_embeds = torch.randn((BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=get_torch_dtype(args.precision), device=args.device)
-    attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
-    cache_position = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device)
-    position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
-    kwarg_inputs = {
-        "inputs_embeds": inputs_embeds,
-        # "cache_position": cache_position,
-        "position_ids": position_ids,
-        # "attention_mask": attention_mask,
-        "output_hidden_states": True,
-    }
-
-    BATCH_DIM = torch.export.Dim("batch", min=1, max=8)
-    SEQ_LEN_DIM = torch.export.Dim("seq_len", min=1, max=350)
-    kwarg_dynamic_shapes = {
-        "inputs_embeds": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
-        # "cache_position": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
-        "position_ids": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
-        # "attention_mask": {1: SEQ_LEN_DIM}, # 0: BATCH_DIM, 
-        "output_hidden_states": None,
-    }
-
-    settings = get_compilation_args(args)
-
-    trt_language_model = torch_tensorrt.MutableTorchTensorRTModule(language_model, **settings)
-    trt_language_model.set_expected_dynamic_shape_range((), kwarg_dynamic_shapes)
-    with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
-        trt_language_model(**kwarg_inputs)
-    
-    eval_outputs(language_model, trt_language_model, kwarg_inputs, args)
-
-    if args.benchmark and args.fn_name == "language_model":
-        pyt_timings = benchmark_policy(language_model, (), kwarg_inputs, args=args)
-        trt_timings = benchmark_policy(trt_language_model, (), kwarg_inputs, args=args)
-        compare_benchmark_outputs(pyt_timings, trt_timings)
-
-    return trt_language_model
 
 def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Namespace, attention_mask: Optional[torch.Tensor] = None):
     """
@@ -413,9 +365,38 @@ def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Names
     Returns:
         The compiled eagle backbone
     """
+    # This setting is specific to Eagle2.5VL model which uses SiglipVisionModel as the vision model.
+    # The use_head adds a multi-attention head on the encoder outputs which isn't used in Eagle2.5VL model
+    # and hence we set the use_head flag to False to avoid the latency introduced by the head.
+    eagle_backbone.vision_model.vision_model.use_head = False
+
     if args.use_eagle_backbone_joint:
         return compile_eagle_backbone_joint(eagle_backbone, args, attention_mask=attention_mask)
-
+    
+    # Define kwarg inputs and dynamic shapes
+    BATCH_SIZE = 1
+    SEQ_LEN = 296 #attention_mask.shape[1] if attention_mask is not None else 296
+    NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
+    IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
+    input_ids = torch.randint(100, (BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
+    position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
+    pixel_values = torch.randn(
+        (BATCH_SIZE, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
+        dtype=get_torch_dtype(args.precision),
+        device=args.device,
+    )
+    # input_ids cannot be random since there is index_put in the graph and it goes out of bounds if the input is random.
+    input_ids[:, : eagle_backbone.num_image_token] = eagle_backbone.image_token_index
+    
+    kwarg_inputs = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "output_hidden_states": True,
+        "pixel_values": pixel_values,
+        "return_dict": True,
+    }
+    if args.benchmark and args.fn_name == "eagle_backbone":
+        pyt_timings = benchmark_policy(eagle_backbone, (), kwarg_inputs, args=args)
     eagle_backbone.vision_model.config._attn_implementation = ATTN_IMPLEMENTATION
     eagle_backbone.language_model.config._attn_implementation = ATTN_IMPLEMENTATION
 
@@ -426,6 +407,12 @@ def compile_eagle_backbone(eagle_backbone: torch.nn.Module, args: argparse.Names
     # Compile the language model
     trt_language_model = compile_language_model(eagle_backbone.language_model, args, attention_mask=attention_mask)
     eagle_backbone.language_model = trt_language_model
+
+    # eval_outputs(eagle_backbone, trt_eagle_backbone, kwarg_inputs, args)
+
+    if args.benchmark and args.fn_name == "eagle_backbone":
+        trt_timings = benchmark_policy(eagle_backbone, (), kwarg_inputs, args=args)
+        compare_benchmark_outputs(pyt_timings, trt_timings)
 
     return eagle_backbone
 
@@ -454,17 +441,16 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
     HIDDEN_SIZE = 2048
     NUM_CHANNELS = eagle_backbone.vision_model.config.num_channels
     IMAGE_SIZE = eagle_backbone.vision_model.config.image_size
-    # The following inputs cannot be random since there is index_put in the graph and it goes out of bounds if the input is random.
-    # input_ids = torch.randint(100, (BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
-    # position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
-    # pixel_values = torch.randn(
-    #     (BATCH_SIZE, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
-    #     dtype=get_torch_dtype(args.precision),
-    #     device=args.device,
-    # )
-    input_ids = torch.load('egb_input_ids.pt').to(args.device)
+    # input_ids cannot be random since there is index_put in the graph and it goes out of bounds if the input is random.
+    input_ids = torch.randint(100, (BATCH_SIZE, SEQ_LEN), dtype=torch.int64, device=args.device)
     position_ids = torch.arange(SEQ_LEN, dtype=torch.int64, device=args.device).unsqueeze(0).repeat(BATCH_SIZE, 1)
-    pixel_values = torch.load('egb_pixel_values.pt').to(args.device)
+    pixel_values = torch.randn(
+        (BATCH_SIZE, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
+        dtype=get_torch_dtype(args.precision),
+        device=args.device,
+    )
+    input_ids[:, : eagle_backbone.num_image_token] = eagle_backbone.image_token_index
+
     kwarg_inputs = {
         "input_ids": input_ids,
         "position_ids": position_ids,
@@ -490,7 +476,7 @@ def compile_eagle_backbone_joint(eagle_backbone: torch.nn.Module, args: argparse
     with (torch_tensorrt.dynamo.Debugger() if args.debug else nullcontext()):
         trt_eagle_backbone(**kwarg_inputs)
     
-    eval_outputs(eagle_backbone, trt_eagle_backbone, kwarg_inputs, args)
+    # eval_outputs(eagle_backbone, trt_eagle_backbone, kwarg_inputs, args)
 
     if args.benchmark and args.fn_name == "eagle_backbone":
         pyt_timings = benchmark_policy(eagle_backbone, (), kwarg_inputs, args=args)
